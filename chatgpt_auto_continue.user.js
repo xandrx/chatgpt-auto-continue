@@ -957,7 +957,7 @@
                 .replace(/</g, '&lt;').replace(/>/g, '&gt;')
                 .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
             document.execCommand('insertHTML', false,
-                escaped.split('\\n').map(line => '<p>' + (line || '<br>') + '</p>').join(''));
+                escaped.split('\n').map(line => '<p>' + (line || '<br>') + '</p>').join(''));
         })) return true;
 
         return false;
