@@ -1,77 +1,82 @@
 # ChatGPT Auto Continue
 
-Пользовательский скрипт (userscript) для **Tampermonkey**, который автоматически продолжает диалог в [ChatGPT](https://chatgpt.com/) после завершения ответа ассистента. Включает компактную плавающую панель управления, стоп-слово, статистику и защиту от преждевременной отправки сообщений.
+**Language:** English | [Русский](README.ru.md)
 
-**Текущая версия:** 1.19  
-**Язык интерфейса:** русский  
-**Поддерживаемый сайт:** `https://chatgpt.com/*`
+A **Tampermonkey userscript** that automatically continues a [ChatGPT](https://chatgpt.com/) conversation once the assistant has finished responding. It provides a compact floating control panel, configurable stop word, session statistics, and safeguards against sending a follow-up while a response is still being generated.
 
-> Неофициальный проект. Не связан с OpenAI. Автоматическая отправка сообщений расходует доступные лимиты ChatGPT и может продолжить работу без ручного подтверждения. Следите за работой скрипта и не используйте его для бесконтрольного выполнения чувствительных действий.
+**Current version:** 1.19  
+**Interface language:** Russian  
+**Supported website:** `https://chatgpt.com/*`
 
-## Установка
+> This is an unofficial project and is not affiliated with OpenAI. Automatically sending messages may consume your ChatGPT usage limits and continue an interaction without manual approval. Monitor its activity and avoid using it for unsupervised sensitive actions.
 
-1. Установите расширение [Tampermonkey](https://www.tampermonkey.net/) в браузер.
-2. Откройте [файл скрипта](https://github.com/xandrx/chatgpt-auto-continue/raw/refs/heads/main/chatgpt_auto_continue.user.js) и установите его в Tampermonkey. Если браузер показал исходный код, создайте новый userscript в панели Tampermonkey и вставьте код вручную.
-3. Откройте или обновите вкладку [ChatGPT](https://chatgpt.com/).
-4. Найдите плавающую панель **ChatGPT Auto Continue**.
+## Installation
 
-## Возможности
+1. Install the [Tampermonkey](https://www.tampermonkey.net/) browser extension.
+2. Open the [userscript file](https://github.com/xandrx/chatgpt-auto-continue/raw/refs/heads/main/chatgpt_auto_continue.user.js) and install it through Tampermonkey. If your browser displays the source code instead, create a new userscript in Tampermonkey and paste the code manually.
+3. Open or refresh [ChatGPT](https://chatgpt.com/).
+4. Find the **ChatGPT Auto Continue** floating panel.
 
-- **Автопродолжение:** отправляет заданный текст после подтверждённого завершения ответа ассистента. Исходный текст — `Продолжай`.
-- **Защита от ложного завершения (v1.19):** проверяет состояние генерации по кнопке остановки, атрибутам ответа и индикатору **текущего диалога** в боковом списке чатов (`data-sidebar-indicator="working"`).
-- **Проверка стабильности:** после исчезновения признаков генерации ждёт **5 секунд**; если строка чата в боковой панели недоступна, ждёт **10 секунд**. Возобновление генерации сбрасывает ожидание.
-- **Защита от повторной отправки:** повторно проверяет генерацию непосредственно перед отправкой; при возобновлении удаляет подготовленный скриптом черновик, если пользователь его не изменил.
-- **Контроль получения ответа:** не отправляет следующий запрос, пока не подтверждён ответ на предыдущий; при таймауте ожидания отключает автоматический режим.
-- **Стоп-слово:** отслеживает заданный маркер **в последнем ответе ассистента**, отключает автопродолжение и воспроизводит уведомление. По умолчанию — `STOP_IT`.
-- **Стоп-промпт:** добавляет к основному запросу инструкцию об условиях остановки; шаблон `{STOP_WORD}` заменяется выбранным словом.
-- **Плавающая панель:** включение/отключение, ручная отправка, сворачивание, перемещение и сохранение положения.
-- **Автоскролл:** прокручивает диалог вниз, но учитывает ручную прокрутку пользователя.
-- **Индикация вкладки:** обновляет заголовок и favicon во время генерации и после её завершения.
-- **Звуки и статистика:** уведомления, счётчик продолжений, время работы и средняя длительность цикла.
-- **Настройки диалогов:** сохраняются в браузере отдельно для чатов с использованием `localStorage`.
+## Features
 
-## Использование
+- **Automatic continuation:** Sends your configured message after the assistant's response is confirmed complete. The default prompt is `Продолжай` (“Continue”).
+- **False-completion protection (v1.19):** Detects active generation using the Stop button, assistant response attributes, and the **current conversation's** sidebar indicator (`data-sidebar-indicator="working"`).
+- **Stable completion check:** Waits **5 seconds** after all generation indicators disappear, or **10 seconds** if the conversation row is unavailable in the sidebar. If generation resumes, the timer resets.
+- **Duplicate-send prevention:** Rechecks generation immediately before sending. If generation resumes, it cancels the prepared draft as long as the user has not edited it.
+- **Response confirmation:** Does not start another cycle until a new response to the previous message is confirmed. If the response times out, automatic mode is disabled.
+- **Stop word:** Watches for a marker **in the assistant's latest reply**. On detection, it disables automatic continuation and plays a notification sound. Default: `STOP_IT`.
+- **Stop instruction:** Appends configurable stopping criteria to the continuation prompt. The `{STOP_WORD}` placeholder is replaced with the configured marker.
+- **Floating panel:** Enable/disable automation, manually send a message, collapse the panel, drag it, and save its position.
+- **Auto-scroll:** Follows new messages while respecting manual scrolling.
+- **Browser tab indicator:** Changes the tab title and favicon during generation and upon completion.
+- **Sounds and statistics:** Notification sounds, continuation counter, elapsed time, and average cycle duration.
+- **Per-conversation preferences:** Stores chat-specific settings in the browser using `localStorage`.
 
-1. В панели оставьте или измените основной **промпт для продолжения**.
-2. При необходимости задайте **стоп-промпт** и **стоп-слово**.
-3. Включите режим **Вкл**. Когда ассистент закончит текущий ответ и индикаторы останутся неактивными в течение проверочного периода, скрипт отправит продолжение.
-4. Для остановки вручную нажмите **Выкл**. Кнопка **▶** отправляет запрос вручную, если отправка безопасна по текущим проверкам.
+## How to use
 
-Скрипт не должен перезаписывать уже заполненное пользователем поле ввода.
+1. In the panel, keep or customize the **continuation prompt**.
+2. Optionally configure the **stop instruction** and **stop word**.
+3. Switch automation **on** (the Russian button reads **Вкл**). Once ChatGPT finishes the response and activity indicators remain absent for the confirmation period, the script sends the next prompt.
+4. Switch it **off** (**Выкл**) to stop automatic continuation. The **▶** button sends the prompt manually, subject to the same generation safety checks.
 
-## Автоматическое обновление
+The script is designed not to overwrite text you have already entered in ChatGPT's composer.
 
-В метаданных userscript используются постоянные ссылки на ветку `main`:
+## Automatic updates
+
+The userscript includes stable URLs pointing to the `main` branch:
 
 ```javascript
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 ```
 
-Для следующих релизов необходимо увеличить `@version`, опубликовать новый код **под тем же именем файла** и дождаться проверки обновлений Tampermonkey (либо запустить её вручную в расширении). Старые установки из Gist не переключатся на новый источник автоматически: им потребуется один раз установить версию из этого репозитория.
+For future releases, increase the userscript's `@version`, update the file **without changing its name**, and let Tampermonkey check for updates (or trigger the check manually).
 
-## Структура проекта
+**Migrating from the old Gist:** Existing installations pointing to the Gist do not automatically switch update sources. Install the script from this repository once to receive subsequent updates here.
+
+## Project structure
 
 ```text
 chatgpt-auto-continue/
-├── chatgpt_auto_continue.user.js  # Основной Tampermonkey userscript
-└── README.md                      # Документация проекта
+├── chatgpt_auto_continue.user.js  # Tampermonkey userscript
+├── README.md                      # English documentation (default)
+└── README.ru.md                   # Russian documentation
 ```
 
-## Изменения
+## Changelog
 
 ### v1.19
 
-- Добавлена проверка индикатора генерации активного чата в боковой панели.
-- Добавлена задержка подтверждения завершения: 5 или 10 секунд в зависимости от доступности строки чата.
-- Усилена защита от повторной отправки после кратковременного появления кнопки отправки.
-- Добавлена отмена подготовленного черновика при возобновлении генерации.
-- Улучшена обработка отсутствия подтверждённого ответа.
+- Added detection of the active chat's generation indicator in the sidebar.
+- Added completion confirmation delays of 5 or 10 seconds, depending on sidebar availability.
+- Improved protection against sending another message when the Send button appears briefly during an ongoing response.
+- Added cancellation of the script-prepared draft when generation resumes.
+- Improved handling of an unconfirmed response.
 
-## Ограничения
+## Limitations
 
-Скрипт зависит от DOM-разметки ChatGPT: изменения интерфейса могут потребовать корректировки селекторов. Если боковая панель отсутствует в DOM, используется резервная проверка. Фоновая вкладка может опрашивать DOM реже из-за ограничений браузера. Проверка синтаксиса и сценариев не заменяет тестирования в реальном интерфейсе.
+This userscript depends on ChatGPT's current DOM structure. UI changes may require selector updates. If the sidebar conversation row is missing from the DOM, the script falls back to other activity signals and a longer confirmation delay. Background tabs may be polled less frequently due to browser throttling. Syntax and simulated-state checks are not substitutes for testing against the live interface.
 
-## Лицензия
+## License
 
-Лицензия в репозитории пока не указана. Если планируется разрешить другим пользователям свободно использовать, изменять и распространять проект, добавьте отдельный файл `LICENSE` (например, MIT).
+No license has been specified for the repository yet. If you want to permit reuse, modification, and redistribution, add a `LICENSE` file (for example, MIT).
