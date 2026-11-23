@@ -4,7 +4,7 @@
 
 A **Tampermonkey userscript** that automatically continues a [ChatGPT](https://chatgpt.com/) conversation once the assistant has finished responding. It provides a compact floating control panel, configurable stop word, session statistics, and safeguards against sending a follow-up while a response is still being generated.
 
-**Current version:** 1.19  
+**Current version:** 1.20  
 **Interface language:** Russian  
 **Supported website:** `https://chatgpt.com/*`
 
@@ -64,6 +64,13 @@ chatgpt-auto-continue/
 ```
 
 ## Changelog
+
+### v1.20
+
+- Fixed a failure to populate the ChatGPT prompt field when using the manual **▶** button or automatic continuation.
+- Added clipboard paste and HTML insertion fallbacks for contenteditable / ProseMirror editors.
+- Confirmed success by inspecting editor text instead of trusting the deprecated `execCommand` return value.
+- Preserved the existing generation-in-progress and duplicate-send safeguards.
 
 ### v1.19
 
