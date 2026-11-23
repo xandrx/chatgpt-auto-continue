@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Auto Continue + Floating Panel
 // @namespace    http://tampermonkey.net/
-// @version      1.19
+// @version      1.20
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @description  Автопродолжение с проверкой активности текущего чата в боковой панели, защитой от ложного завершения, звуками и статистикой
@@ -892,33 +892,75 @@
             : (el.innerText || el.textContent || '');
     }
 
+    function selectComposerContents(el) {
+        const selection = window.getSelection();
+        if (!selection) return false;
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        return true;
+    }
+
+    function composerContainsExpectedText(el, value) {
+        return normalizeText(getComposerText(el)) === normalizeText(value);
+    }
+
     function setComposerText(el, value) {
         if (!el || !el.isConnected || getComposerText(el).trim()) return false;
-        el.focus();
 
         if (typeof el.value === 'string') {
+            el.focus();
             const prototype = el.tagName === 'TEXTAREA'
                 ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
             const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
             if (setter) setter.call(el, value);
             else el.value = value;
             el.dispatchEvent(new Event('input', { bubbles: true }));
-            return el.value === value;
+            return composerContainsExpectedText(el, value);
         }
 
-        const selection = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        selection.removeAllRanges();
-        selection.addRange(range);
-        // execCommand is deprecated, but still triggers the ProseMirror edit
-        // pipeline in Chromium; a direct innerHTML assignment does not.
-        try {
-            const inserted = document.execCommand('insertText', false, value);
-            return Boolean(inserted) && normalizeText(getComposerText(el)) === normalizeText(value);
-        } catch (_) {
-            return false;
-        }
+        if (el.getAttribute('contenteditable') !== 'true') return false;
+
+        // A number of ChatGPT editor variants use ProseMirror. Only supported
+        // editing events should mutate its document; assigning innerHTML would
+        // bypass the editor's state and might send an empty/stale message.
+        const attempt = (operation) => {
+            if (!el.isConnected || getComposerText(el).trim()) return false;
+            try {
+                el.focus();
+                if (!selectComposerContents(el)) return false;
+                operation();
+            } catch (_) {}
+            // execCommand may return false even when the DOM actually changed.
+            // Verify the resulting content rather than the command's return value.
+            return composerContainsExpectedText(el, value);
+        };
+
+        if (attempt(() => document.execCommand('insertText', false, value))) return true;
+        // Clipboard paste is handled by ProseMirror and preserves multiline text.
+        if (attempt(() => {
+            if (typeof DataTransfer === 'undefined' || typeof ClipboardEvent === 'undefined') return;
+            const data = new DataTransfer();
+            data.setData('text/plain', value);
+            el.dispatchEvent(new ClipboardEvent('paste', {
+                bubbles: true,
+                cancelable: true,
+                clipboardData: data
+            }));
+        })) return true;
+
+        // Some Chromium editor versions accept HTML insertion but not plain
+        // insertText. Escape all user-supplied content before building markup.
+        if (attempt(() => {
+            const escaped = value.replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+            document.execCommand('insertHTML', false,
+                escaped.split('\\n').map(line => '<p>' + (line || '<br>') + '</p>').join(''));
+        })) return true;
+
+        return false;
     }
 
     function triggerSend() {
