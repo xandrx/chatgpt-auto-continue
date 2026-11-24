@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Auto Continue + Floating Panel
 // @namespace    http://tampermonkey.net/
-// @version      1.21
+// @version      1.22
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @description  Автопродолжение с проверкой активности текущего чата в боковой панели, защитой от ложного завершения, звуками и статистикой
@@ -42,6 +42,9 @@
     // A response is complete only after ALL known activity signals stay quiet.
     const COMPLETION_STABLE_MS = 5000;
     const COMPLETION_STABLE_NO_SIDEBAR_MS = 10000;
+    // A stale assistant aria-busy flag must not block the panel forever when
+    // the sidebar explicitly says idle and the composer is ready.
+    const UNCORROBORATED_BUSY_STALE_MS = 45000;
 
     const STORAGE_DEFAULTS_KEY = 'cgpt_autocont_defaults_v4';
     const STORAGE_CHATS_KEY = 'cgpt_autocont_chats_v4';
@@ -73,6 +76,9 @@
     let pendingSubmitToken = 0;
     let pendingOwnedDraft = null;
     let completionCandidateSinceMs = 0;
+    let weakBusySinceMs = 0;
+    let weakBusyTurn = null;
+    let weakBusyTextFingerprint = null;
     let userScrolledAway = false;
     let lastScrollTop = 0;
 
@@ -635,6 +641,9 @@
             saveTabChatState(currentChatKey);
         }
         currentChatKey = nextKey;
+        weakBusySinceMs = 0;
+        weakBusyTurn = null;
+        weakBusyTextFingerprint = null;
         const cfg = getChatConfig(currentChatKey);
         const tabState = loadTabChatState(currentChatKey);
         enabled = tabState.enabled;
@@ -701,25 +710,26 @@
 
     function getStopButton() {
         const root = getComposerRoot();
-        const candidates = [
-            ...(root ? root.querySelectorAll('button') : []),
-            ...document.querySelectorAll(
-                'button[data-testid="stop-button"], button[aria-label*="Stop"], button[aria-label*="Остановить"]'
-            )
-        ];
+        // Only the composer Stop action proves an active response. Loose
+        // includes('stop') previously matched unrelated controls such as
+        // "Stop recording", and hidden buttons could survive in the DOM.
+        const candidates = root
+            ? [...root.querySelectorAll('button')]
+            : [...document.querySelectorAll('button[data-composer-stop="true"], button[data-testid="stop-button"]')];
 
         for (const btn of candidates) {
             const testId = (btn.getAttribute('data-testid') || '').toLowerCase();
-            const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
-            const compStop = btn.getAttribute('data-composer-stop');
+            const aria = (btn.getAttribute('aria-label') || '').trim();
+            const isStop = btn.getAttribute('data-composer-stop') === 'true' ||
+                testId === 'stop-button' || testId === 'composer-stop-button' ||
+                /^(?:stop(?: generating| generation| response)?|остановить(?: генерацию| ответ)?)$/iu.test(aria);
 
-            const isStop = compStop === 'true' || testId.includes('stop') ||
-                aria.includes('остановить') || aria.includes('stop');
-            if (isStop && btn.isConnected && !btn.closest('[hidden]') &&
-                window.getComputedStyle(btn).display !== 'none' &&
-                window.getComputedStyle(btn).visibility !== 'hidden') {
-                return btn;
-            }
+            if (!isStop || !btn.isConnected || btn.closest('[hidden], [aria-hidden="true"], [inert]') ||
+                btn.getAttribute('aria-hidden') === 'true' || !btn.getClientRects().length) continue;
+
+            const style = window.getComputedStyle(btn);
+            if (style.display !== 'none' && style.visibility !== 'hidden' &&
+                style.visibility !== 'collapse' && style.opacity !== '0') return btn;
         }
         return null;
     }
@@ -735,15 +745,16 @@
         return [...document.querySelectorAll('[data-dil-message-id][data-message-author-role="assistant"]')];
     }
 
-    function isAssistantStreamingNow() {
+    function getAssistantStreamingFlag() {
         const turns = getAssistantElements();
-        const lastTurn = turns[turns.length - 1];
-        // Do not infer completion from a lack of text changes. Reasoning and tool
-        // calls may cause long pauses with the real Stop button still visible.
-        return Boolean(getStopButton()) || Boolean(lastTurn && (
+        const lastTurn = turns[turns.length - 1] || null;
+        // A single leftover aria-busy/data-is-streaming attribute is weaker
+        // evidence than the real Stop button or the matching sidebar spinner.
+        const active = Boolean(lastTurn && (
             lastTurn.getAttribute('data-is-streaming') === 'true' ||
             lastTurn.getAttribute('aria-busy') === 'true'
         ));
+        return { active, lastTurn };
     }
 
     // Resolve the sidebar indicator for THIS conversation only. A spinner in a
@@ -774,11 +785,43 @@
 
     function getGenerationSignals() {
         const sidebar = getCurrentSidebarGenerationState();
-        const composer = isAssistantStreamingNow();
+        const stopButton = Boolean(getStopButton());
+        const { active: replyFlag, lastTurn } = getAssistantStreamingFlag();
+        const send = getSendButton();
+        const sendReady = Boolean(send && send.isConnected && !send.disabled &&
+            send.getAttribute('aria-disabled') !== 'true');
+        let staleReplyFlag = false;
+
+        // ChatGPT sometimes leaves a response attribute "busy" after an
+        // interrupted reply. Clear only this weak signal (never a real Stop
+        // button or sidebar spinner) once we have 45s of corroborating idle
+        // evidence and unchanged assistant content. Text updates reset the wait.
+        if (replyFlag && !stopButton && sidebar === 'idle' && sendReady) {
+            const text = lastTurn?.textContent || '';
+            const fingerprint = text.length + ':' + text.slice(-160);
+            if (weakBusyTurn !== lastTurn || weakBusyTextFingerprint !== fingerprint ||
+                !weakBusySinceMs) {
+                weakBusyTurn = lastTurn;
+                weakBusyTextFingerprint = fingerprint;
+                weakBusySinceMs = Date.now();
+            } else {
+                staleReplyFlag = Date.now() - weakBusySinceMs >= UNCORROBORATED_BUSY_STALE_MS;
+            }
+        } else {
+            weakBusySinceMs = 0;
+            weakBusyTurn = null;
+            weakBusyTextFingerprint = null;
+        }
+
         return {
             sidebar,
-            composer,
-            active: sidebar === 'working' || composer
+            stopButton,
+            replyFlag,
+            staleReplyFlag,
+            sendReady,
+            // Strong signals always win. In particular, a briefly enabled
+            // Send button MUST NOT override a working sidebar indicator.
+            active: sidebar === 'working' || stopButton || (replyFlag && !staleReplyFlag)
         };
     }
 
@@ -1654,6 +1697,16 @@
 
         const signals = getGenerationSignals();
         const now = Date.now();
+        if (statusBadgeEl) {
+            statusBadgeEl.title = [
+                'Генерация — диагностика',
+                'Sidebar: ' + signals.sidebar,
+                'Кнопка Stop: ' + (signals.stopButton ? 'да' : 'нет'),
+                'Атрибут busy: ' + (signals.replyFlag ? 'да' : 'нет'),
+                'Busy устарел: ' + (signals.staleReplyFlag ? 'да' : 'нет'),
+                'Отправка доступна: ' + (signals.sendReady ? 'да' : 'нет')
+            ].join('\\n');
+        }
 
         // A new assistant message confirms a successfully submitted continuation.
         // Sidebar activity alone is not proof that the new message was accepted.
@@ -1669,7 +1722,9 @@
             }
             wasGenerating = true;
             setTabIndicator('working');
-            setStatus(signals.sidebar === 'working' ? 'Генерация · чат' : 'Генерация...', 'gen');
+            setStatus(signals.sidebar === 'working' ? 'Генерация · чат'
+                : signals.stopButton ? 'Генерация · Stop'
+                    : 'Генерация · busy', 'gen');
             performAutoScroll();
             updateStatsUI();
             return;
@@ -1696,6 +1751,12 @@
         }
 
         if (wasGenerating) {
+            // The sidebar and real Stop button were idle long enough to dismiss
+            // a stale reply attribute. Still require the standard completion
+            // confirmation interval before any automatic send.
+            if (signals.staleReplyFlag) {
+                setStatus('Устаревший busy · проверка', 'gen');
+            }
             // Send can appear for a moment in the middle of a tool/reasoning
             // cycle. Require a stable quiet period before considering completion.
             if (!completionCandidateSinceMs) completionCandidateSinceMs = now;
