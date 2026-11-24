@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Auto Continue + Floating Panel
 // @namespace    http://tampermonkey.net/
-// @version      1.22
+// @version      1.23
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @description  Автопродолжение с проверкой активности текущего чата в боковой панели, защитой от ложного завершения, звуками и статистикой
@@ -77,7 +77,6 @@
     let pendingOwnedDraft = null;
     let completionCandidateSinceMs = 0;
     let weakBusySinceMs = 0;
-    let weakBusyTurn = null;
     let weakBusyTextFingerprint = null;
     let userScrolledAway = false;
     let lastScrollTop = 0;
@@ -642,7 +641,6 @@
         }
         currentChatKey = nextKey;
         weakBusySinceMs = 0;
-        weakBusyTurn = null;
         weakBusyTextFingerprint = null;
         const cfg = getChatConfig(currentChatKey);
         const tabState = loadTabChatState(currentChatKey);
@@ -790,18 +788,22 @@
         const send = getSendButton();
         const sendReady = Boolean(send && send.isConnected && !send.disabled &&
             send.getAttribute('aria-disabled') !== 'true');
+        // A blank editor usually disables Send. Check the editor itself.
+        const editor = getComposerInput();
+        const composerEditable = Boolean(editor && editor.isConnected &&
+            !editor.disabled && editor.getAttribute('aria-disabled') !== 'true' &&
+            (typeof editor.value === 'string' || editor.isContentEditable ||
+             editor.getAttribute('contenteditable') === 'true'));
         let staleReplyFlag = false;
 
         // ChatGPT sometimes leaves a response attribute "busy" after an
         // interrupted reply. Clear only this weak signal (never a real Stop
         // button or sidebar spinner) once we have 45s of corroborating idle
         // evidence and unchanged assistant content. Text updates reset the wait.
-        if (replyFlag && !stopButton && sidebar === 'idle' && sendReady) {
+        if (replyFlag && !stopButton && sidebar === 'idle' && composerEditable) {
             const text = lastTurn?.textContent || '';
             const fingerprint = text.length + ':' + text.slice(-160);
-            if (weakBusyTurn !== lastTurn || weakBusyTextFingerprint !== fingerprint ||
-                !weakBusySinceMs) {
-                weakBusyTurn = lastTurn;
+            if (weakBusyTextFingerprint !== fingerprint || !weakBusySinceMs) {
                 weakBusyTextFingerprint = fingerprint;
                 weakBusySinceMs = Date.now();
             } else {
@@ -809,8 +811,7 @@
             }
         } else {
             weakBusySinceMs = 0;
-            weakBusyTurn = null;
-            weakBusyTextFingerprint = null;
+                weakBusyTextFingerprint = null;
         }
 
         return {
@@ -819,6 +820,7 @@
             replyFlag,
             staleReplyFlag,
             sendReady,
+            composerEditable,
             // Strong signals always win. In particular, a briefly enabled
             // Send button MUST NOT override a working sidebar indicator.
             active: sidebar === 'working' || stopButton || (replyFlag && !staleReplyFlag)
@@ -1704,8 +1706,9 @@
                 'Кнопка Stop: ' + (signals.stopButton ? 'да' : 'нет'),
                 'Атрибут busy: ' + (signals.replyFlag ? 'да' : 'нет'),
                 'Busy устарел: ' + (signals.staleReplyFlag ? 'да' : 'нет'),
-                'Отправка доступна: ' + (signals.sendReady ? 'да' : 'нет')
-            ].join('\\n');
+                'Отправка доступна: ' + (signals.sendReady ? 'да' : 'нет'),
+                'Редактор доступен: ' + (signals.composerEditable ? 'да' : 'нет')
+            ].join('\n');
         }
 
         // A new assistant message confirms a successfully submitted continuation.
