@@ -4,7 +4,7 @@
 
 A **Tampermonkey userscript** that automatically continues a [ChatGPT](https://chatgpt.com/) conversation once the assistant has finished responding. It provides a compact floating control panel, configurable stop word, session statistics, and safeguards against sending a follow-up while a response is still being generated.
 
-**Current version:** 1.21  
+**Current version:** 1.24  
 **Interface language:** Russian  
 **Supported website:** `https://chatgpt.com/*`
 
@@ -66,6 +66,14 @@ chatgpt-auto-continue/
 
 ## Changelog
 
+### v1.24 — Stuck generation signal recovery
+
+- Replaced broad Stop-button matching with precise composer button labels/test IDs and visibility checks. Unrelated controls and hidden buttons no longer count as an active generation.
+- Added source-specific status text: `Генерация · чат` (sidebar), `Генерация · Stop` (Stop button), and `Генерация · busy` (assistant reply attribute). Hover over the status badge to inspect the detected signals.
+- Detects a lingering `aria-busy` / `data-is-streaming` flag when neither Stop nor the sidebar confirms generation and the response text is unchanged: after **45 seconds** with an idle sidebar and editable composer, or **120 seconds** with insufficient corroboration.
+- **Fail-safe:** ambiguous stale flags pause auto-continuation and display `Зависший busy · проверка`; the script does **not** send a new message automatically after a manually stopped or uncertain response.
+- The sidebar's `working` indicator and a real Stop button still take priority, regardless of elapsed time.
+
 ### v1.21
 
 - Fixed on/off state unexpectedly propagating between ChatGPT tabs.
@@ -90,6 +98,8 @@ chatgpt-auto-continue/
 - Improved handling of an unconfirmed response.
 
 ## Limitations
+
+The script cannot determine from DOM attributes alone whether a response was manually stopped. If a stale `busy` signal is detected, verify the conversation before turning automation back on. If the sidebar still marks the conversation as `working`, the script conservatively waits rather than assuming completion.
 
 This userscript depends on ChatGPT's current DOM structure. UI changes may require selector updates. If the sidebar conversation row is missing from the DOM, the script falls back to other activity signals and a longer confirmation delay. Background tabs may be polled less frequently due to browser throttling. Syntax and simulated-state checks are not substitutes for testing against the live interface.
 
