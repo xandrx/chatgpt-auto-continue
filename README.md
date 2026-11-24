@@ -4,7 +4,7 @@
 
 A **Tampermonkey userscript** that automatically continues a [ChatGPT](https://chatgpt.com/) conversation once the assistant has finished responding. It provides a compact floating control panel, configurable stop word, session statistics, and safeguards against sending a follow-up while a response is still being generated.
 
-**Current version:** 1.20  
+**Current version:** 1.21  
 **Interface language:** Russian  
 **Supported website:** `https://chatgpt.com/*`
 
@@ -30,7 +30,8 @@ A **Tampermonkey userscript** that automatically continues a [ChatGPT](https://c
 - **Auto-scroll:** Follows new messages while respecting manual scrolling.
 - **Browser tab indicator:** Changes the tab title and favicon during generation and upon completion.
 - **Sounds and statistics:** Notification sounds, continuation counter, elapsed time, and average cycle duration.
-- **Per-conversation preferences:** Stores chat-specific settings in the browser using `localStorage`.
+- **Independent tabs (v1.21):** Each tab keeps its own on/off state and continuation statistics in `sessionStorage`, per conversation. Enabling a chat in one tab does not enable it in another separately opened tab.
+- **Shared prompt preferences:** Prompt text, stop instructions, and stop words remain stored per conversation in `localStorage`; changes to these preferences no longer reset another tab's generation or pending submission.
 
 ## How to use
 
@@ -64,6 +65,14 @@ chatgpt-auto-continue/
 ```
 
 ## Changelog
+
+### v1.21
+
+- Fixed on/off state unexpectedly propagating between ChatGPT tabs.
+- Moved the enabled flag and session statistics out of shared `localStorage` and into tab-scoped `sessionStorage` (separately for each conversation).
+- Prevented cross-tab storage events from resetting pending submissions or generation tracking.
+- Removed legacy shared enabled/statistics properties on the next settings save.
+- For safety, previously shared enabled flags are **not migrated**: enable auto-continue manually in each tab after updating.
 
 ### v1.20
 
