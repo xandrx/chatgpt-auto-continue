@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Auto Continue + Floating Panel
 // @namespace    http://tampermonkey.net/
-// @version      1.23
+// @version      1.24
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @description  Автопродолжение с проверкой активности текущего чата в боковой панели, защитой от ложного завершения, звуками и статистикой
@@ -45,6 +45,7 @@
     // A stale assistant aria-busy flag must not block the panel forever when
     // the sidebar explicitly says idle and the composer is ready.
     const UNCORROBORATED_BUSY_STALE_MS = 45000;
+    const UNCERTAIN_BUSY_STALE_MS = 120000;
 
     const STORAGE_DEFAULTS_KEY = 'cgpt_autocont_defaults_v4';
     const STORAGE_CHATS_KEY = 'cgpt_autocont_chats_v4';
@@ -800,14 +801,16 @@
         // interrupted reply. Clear only this weak signal (never a real Stop
         // button or sidebar spinner) once we have 45s of corroborating idle
         // evidence and unchanged assistant content. Text updates reset the wait.
-        if (replyFlag && !stopButton && sidebar === 'idle' && composerEditable) {
+        if (replyFlag && !stopButton && sidebar !== 'working') {
             const text = lastTurn?.textContent || '';
             const fingerprint = text.length + ':' + text.slice(-160);
             if (weakBusyTextFingerprint !== fingerprint || !weakBusySinceMs) {
                 weakBusyTextFingerprint = fingerprint;
                 weakBusySinceMs = Date.now();
             } else {
-                staleReplyFlag = Date.now() - weakBusySinceMs >= UNCORROBORATED_BUSY_STALE_MS;
+                const timeout = sidebar === 'idle' && composerEditable
+                    ? UNCORROBORATED_BUSY_STALE_MS : UNCERTAIN_BUSY_STALE_MS;
+                staleReplyFlag = Date.now() - weakBusySinceMs >= timeout;
             }
         } else {
             weakBusySinceMs = 0;
@@ -1711,6 +1714,25 @@
             ].join('\n');
         }
 
+        // A stale reply flag is ambiguous: the user might have pressed Stop,
+        // or ChatGPT might have failed to clear aria-busy after finishing.
+        // Never convert this state directly into an automatic continuation.
+        // Pause automation and tell the user to verify the conversation.
+        if (signals.staleReplyFlag) {
+            completionCandidateSinceMs = 0;
+            wasGenerating = false;
+            if (enabled) {
+                enabled = false;
+                enabledSinceMs = null;
+                persistCurrentSettings(true);
+                updateToggleUI();
+            }
+            setTabIndicator(null);
+            setStatus('Зависший busy · проверка', 'stop');
+            updateStatsUI();
+            return;
+        }
+
         // A new assistant message confirms a successfully submitted continuation.
         // Sidebar activity alone is not proof that the new message was accepted.
         if (awaitingReply && getAssistantElements().length > submittedAssistantCount) {
@@ -1754,13 +1776,7 @@
         }
 
         if (wasGenerating) {
-            // The sidebar and real Stop button were idle long enough to dismiss
-            // a stale reply attribute. Still require the standard completion
-            // confirmation interval before any automatic send.
-            if (signals.staleReplyFlag) {
-                setStatus('Устаревший busy · проверка', 'gen');
-            }
-            // Send can appear for a moment in the middle of a tool/reasoning
+             // Send can appear for a moment in the middle of a tool/reasoning
             // cycle. Require a stable quiet period before considering completion.
             if (!completionCandidateSinceMs) completionCandidateSinceMs = now;
             const delay = signals.sidebar === 'unknown'
