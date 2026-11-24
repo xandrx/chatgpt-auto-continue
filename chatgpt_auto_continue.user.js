@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Auto Continue + Floating Panel
 // @namespace    http://tampermonkey.net/
-// @version      1.20
+// @version      1.21
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @description  Автопродолжение с проверкой активности текущего чата в боковой панели, защитой от ложного завершения, звуками и статистикой
@@ -45,6 +45,8 @@
 
     const STORAGE_DEFAULTS_KEY = 'cgpt_autocont_defaults_v4';
     const STORAGE_CHATS_KEY = 'cgpt_autocont_chats_v4';
+    // Runtime state belongs to this browser tab, not to every tab of chatgpt.com.
+    const STORAGE_TAB_CHATS_KEY = 'cgpt_autocont_tab_chats_v1';
     const STORAGE_POS_KEY = 'cgpt_autocont_pos_v1';
     const STORAGE_SOUND_KEY = 'cgpt_autocont_sound_v1';
     const STORAGE_AUTOSCROLL_KEY = 'cgpt_autocont_autoscroll_v1';
@@ -52,7 +54,8 @@
 
     let disposed = false;
     let currentChatKey = null;
-    let enabled = true;
+    // A newly opened tab must not inherit an old global enabled flag.
+    let enabled = false;
     let soundEnabled = loadBoolPref(STORAGE_SOUND_KEY, true);
     let autoScrollEnabled = loadBoolPref(STORAGE_AUTOSCROLL_KEY, true);
     let collapsed = loadBoolPref(STORAGE_COLLAPSED_KEY, false);
@@ -536,9 +539,39 @@
         enabledSinceMs = keepEnabledStart ? Date.now() : null;
     }
 
+    function loadTabChatState(chatKey) {
+        try {
+            const all = JSON.parse(sessionStorage.getItem(STORAGE_TAB_CHATS_KEY) || '{}');
+            const saved = all && typeof all === 'object' ? all[chatKey] : null;
+            if (!saved || typeof saved !== 'object') return { enabled: false, stats: null };
+            return {
+                enabled: saved.enabled === true,
+                stats: saved.stats && typeof saved.stats === 'object' ? saved.stats : null
+            };
+        } catch (_) {
+            return { enabled: false, stats: null };
+        }
+    }
+
+    function saveTabChatState(chatKey, includeStats = true) {
+        if (!chatKey) return;
+        try {
+            const raw = JSON.parse(sessionStorage.getItem(STORAGE_TAB_CHATS_KEY) || '{}');
+            const all = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+            const previous = all[chatKey] && typeof all[chatKey] === 'object'
+                ? all[chatKey] : {};
+            all[chatKey] = {
+                enabled: Boolean(enabled),
+                stats: includeStats || !previous.stats
+                    ? { sessionCount, enabledSinceMs, cycleDurationsMs: [...cycleDurationsMs] }
+                    : previous.stats
+            };
+            sessionStorage.setItem(STORAGE_TAB_CHATS_KEY, JSON.stringify(all));
+        } catch (_) {}
+    }
+
     function getChatConfig(chatKey) {
         const defaults = loadJSON(STORAGE_DEFAULTS_KEY, {
-            enabled: true,
             prompt: DEFAULT_CONTINUE_TEXT,
             stopPrompt: DEFAULT_STOP_PROMPT,
             stopWord: DEFAULT_STOP_WORD
@@ -546,8 +579,9 @@
         const chats = loadJSON(STORAGE_CHATS_KEY, {});
         const saved = chats[chatKey] || {};
 
+        // Shared storage contains prompt preferences only. In particular, never
+        // consult legacy .enabled or .stats: they belong to a different tab.
         return {
-            enabled: typeof saved.enabled === 'boolean' ? saved.enabled : Boolean(defaults.enabled),
             prompt:
                 typeof saved.prompt === 'string' && saved.prompt.trim().length > 0
                     ? saved.prompt
@@ -565,57 +599,45 @@
                     ? saved.stopWord.trim()
                     : (typeof defaults.stopWord === 'string'
                         ? defaults.stopWord.trim()
-                        : DEFAULT_STOP_WORD),
-            stats: saved.stats || null
+                        : DEFAULT_STOP_WORD)
         };
     }
 
-    function saveChatConfig(chatKey, nextEnabled, nextPrompt, nextStopPrompt, nextStopWord, includeStats = true) {
-        const cleanPrompt =
-            typeof nextPrompt === 'string' && nextPrompt.trim().length > 0
-                ? nextPrompt
-                : DEFAULT_CONTINUE_TEXT;
-        const cleanStopPrompt =
-            typeof nextStopPrompt === 'string'
-                ? nextStopPrompt
-                : '';
-        const cleanStopWord =
-            typeof nextStopWord === 'string'
-                ? nextStopWord.trim()
-                : '';
+    function saveChatConfig(chatKey, nextPrompt, nextStopPrompt, nextStopWord) {
+        if (!chatKey) return;
+        const cleanPrompt = typeof nextPrompt === 'string' && nextPrompt.trim()
+            ? nextPrompt : DEFAULT_CONTINUE_TEXT;
+        const cleanStopPrompt = typeof nextStopPrompt === 'string' ? nextStopPrompt : '';
+        const cleanStopWord = typeof nextStopWord === 'string' ? nextStopWord.trim() : '';
 
         const chats = loadJSON(STORAGE_CHATS_KEY, {});
-        const prev = chats[chatKey] || {};
-        chats[chatKey] = {
-            enabled: Boolean(nextEnabled),
-            prompt: cleanPrompt,
-            stopPrompt: cleanStopPrompt,
-            stopWord: cleanStopWord,
-            stats: includeStats
-                ? {
-                      sessionCount,
-                      enabledSinceMs,
-                      cycleDurationsMs
-                  }
-                : (prev.stats || null)
-        };
-        saveJSON(STORAGE_CHATS_KEY, chats);
+        const previous = chats[chatKey] || {};
+        // Remove pre-1.21 enabled/stats values whenever this chat is saved.
+        const next = { prompt: cleanPrompt, stopPrompt: cleanStopPrompt, stopWord: cleanStopWord };
+        if (JSON.stringify(previous) !== JSON.stringify(next)) {
+            chats[chatKey] = next;
+            saveJSON(STORAGE_CHATS_KEY, chats);
+        }
 
-        saveJSON(STORAGE_DEFAULTS_KEY, {
-            enabled: Boolean(nextEnabled),
-            prompt: cleanPrompt,
-            stopPrompt: cleanStopPrompt,
-            stopWord: cleanStopWord
-        });
+        const previousDefaults = loadJSON(STORAGE_DEFAULTS_KEY, {});
+        if (JSON.stringify(previousDefaults) !== JSON.stringify(next)) {
+            // Only prompt defaults are shared across tabs; never publish enabled.
+            saveJSON(STORAGE_DEFAULTS_KEY, next);
+        }
     }
 
     function syncStateWithCurrentChat(force = false) {
         const nextKey = getConversationKey();
         if (!force && nextKey === currentChatKey) return;
 
+        // Save the previous chat's per-tab state before SPA navigation.
+        if (currentChatKey && currentChatKey !== nextKey) {
+            saveTabChatState(currentChatKey);
+        }
         currentChatKey = nextKey;
         const cfg = getChatConfig(currentChatKey);
-        enabled = cfg.enabled;
+        const tabState = loadTabChatState(currentChatKey);
+        enabled = tabState.enabled;
         continueText = cfg.prompt;
         stopPrompt = cfg.stopPrompt;
         stopWord = cfg.stopWord;
@@ -631,10 +653,12 @@
         basePageTitle = stripTabPrefix(document.title) || null;
         setTabIndicator(null);
 
-        if (cfg.stats) {
-            sessionCount = Number(cfg.stats.sessionCount) || 0;
-            enabledSinceMs = typeof cfg.stats.enabledSinceMs === 'number' ? cfg.stats.enabledSinceMs : (enabled ? Date.now() : null);
-            cycleDurationsMs = Array.isArray(cfg.stats.cycleDurationsMs) ? cfg.stats.cycleDurationsMs : [];
+        if (tabState.stats) {
+            sessionCount = Number(tabState.stats.sessionCount) || 0;
+            enabledSinceMs = enabled && typeof tabState.stats.enabledSinceMs === 'number'
+                ? tabState.stats.enabledSinceMs : (enabled ? Date.now() : null);
+            cycleDurationsMs = Array.isArray(tabState.stats.cycleDurationsMs)
+                ? tabState.stats.cycleDurationsMs : [];
         } else {
             resetSessionStats(enabled);
         }
@@ -1010,14 +1034,14 @@
     }
 
     function persistCurrentSettings(includeStats = true) {
+        // Global: prompt settings only. Per-tab: armed state and statistics.
         saveChatConfig(
             currentChatKey,
-            enabled,
             getActivePromptText(),
             getActiveStopPromptText(),
-            getActiveStopWord(),
-            includeStats
+            getActiveStopWord()
         );
+        saveTabChatState(currentChatKey, includeStats);
     }
 
     function recordContinuationSent() {
@@ -1716,10 +1740,24 @@
     }
 
     const onStorage = (e) => {
-        if (disposed) return;
-        if (e.key === STORAGE_CHATS_KEY || e.key === STORAGE_DEFAULTS_KEY) {
-            syncStateWithCurrentChat(true);
+        if (disposed || (e.key !== STORAGE_CHATS_KEY && e.key !== STORAGE_DEFAULTS_KEY)) return;
+        // A second tab editing a prompt may refresh the text preferences, but
+        // MUST NOT reset this tab's enabled flag, pending send or cycle state.
+        if (getConversationKey() !== currentChatKey) return;
+        const cfg = getChatConfig(currentChatKey);
+        continueText = cfg.prompt;
+        stopPrompt = cfg.stopPrompt;
+        stopWord = cfg.stopWord;
+        if (promptInputEl && document.activeElement !== promptInputEl) {
+            promptInputEl.value = continueText;
         }
+        if (stopPromptInputEl && document.activeElement !== stopPromptInputEl) {
+            stopPromptInputEl.value = stopPrompt;
+        }
+        if (stopWordInputEl && document.activeElement !== stopWordInputEl) {
+            stopWordInputEl.value = stopWord;
+        }
+        updateStatsUI();
     };
     window.addEventListener('storage', onStorage);
     window.addEventListener('wheel', onWheelOrTouch, { passive: true });
