@@ -177,3 +177,105 @@ test('streaming indicator on assistant turn wrapper is recognized', () => {
     vm.runInContext(functionSource('getAssistantStreamingFlag'),ctx);
     assert.equal(ctx.getAssistantStreamingFlag().active,true);
 });
+
+function submissionFixture({draft = '', accept = true, clickThrows = false, setupThrows = false, enabled = true} = {}) {
+    const state = {now:1000, clicks:0, count:0, user:{count:1,id:'old',text:'Previous'}, errors:[], timer:[], status:'', insertions:0};
+    const editor = {value:draft};
+    const ctx = vm.createContext({
+        Date:{now:()=>state.now},
+        SUBMIT_DELAY_MS:450, SEND_READY_TIMEOUT_MS:5000, SEND_CONFIRM_TIMEOUT_MS:8000,
+        disposed:false, enabled, manualBlockUntil:0, isSubmitting:false, awaitingReply:false,
+        pendingSubmitToken:0, pendingSubmitTimerId:null, pendingOwnedDraft:null, lastSendStage:'',
+        completionCandidateSinceMs:0, hasCompletedOnce:false, submittedAssistantCount:0,
+        submittedAtMs:0, tabRequestStartedAtMs:null, wasGenerating:false, stopNotifiedForCurrentReply:false,
+        setTimeout:(fn,delay)=>{state.timer.push({fn,delay});return state.timer.length;},
+        console:{error:()=>{}},
+        getGenerationSignals:()=>({active:false,composerEditable:true}),
+        getExplicitUiFailure:()=>null, clearTabNotice:()=>{},
+        getActiveStopWord:()=>'', hasStopWordInLastReply:()=>false,
+        getActivePromptText:()=>'Continue', getActiveStopPromptText:()=>'',
+        buildFullPrompt:prompt=>prompt, getComposerInput:()=>editor,
+        getComposerText:el=>el?.value||'', normalizeText:text=>String(text||'').trim(),
+        composerContainsExpectedText:(el,text)=>el?.value===text,
+        setComposerText:(el,text)=>{state.insertions++;el.value=text;return true;},
+        getConversationKey:()=>{if(setupThrows)throw new ReferenceError('mock failure');return 'chat:abc';},
+        getAssistantElements:()=>[{}], getUserMessageSnapshot:()=>({...state.user}),
+        getSendButton:()=>({disabled:false,isConnected:true,getAttribute:()=>null,id:'composer-submit-button',
+            click:()=>{state.clicks++;if(clickThrows)throw new Error('click failed');if(accept){state.user={count:2,id:'new',text:editor.value};editor.value='';}}}),
+        recordContinuationSent:()=>{state.count++;}, playTickSound:()=>{},
+        setStatus:text=>{state.status=text;},setTabIndicator:()=>{},
+        showTabNotice:(mode,reason)=>{state.errors.push(reason);},
+        showManualBlock:reason=>{state.errors.push(reason);},
+        pauseForUiFailure:(mode,reason)=>{state.errors.push(reason);ctx.isSubmitting=false;ctx.awaitingReply=false;ctx.enabled=false;state.timer=[];},
+        cancelPendingSend:()=>{ctx.isSubmitting=false;ctx.pendingSubmitToken++;state.timer=[];}
+    });
+    vm.runInContext(['generationBlocksSend','isSubmissionConfirmed','triggerSend','handleSubmissionException',
+        'scheduleSendStep','runContinueNow','performContinuation'].map(functionSource).join('\n'),ctx);
+    const drain=()=>{for(let i=0;state.timer.length;i++){assert.ok(i<100,'timer loop');const next=state.timer.shift();state.now+=next.delay;next.fn();}};
+    return {ctx,state,editor,drain};
+}
+
+test('manual send completes entire workflow from empty editor to confirmation',()=>{
+    const f=submissionFixture();
+    f.ctx.runContinueNow(true);
+    assert.equal(f.editor.value,'Continue');
+    assert.equal(f.ctx.isSubmitting,true);
+    assert.equal(f.ctx.pendingSubmitToken,1);
+    assert.equal(f.state.clicks,0);
+    f.drain();
+    assert.equal(f.state.clicks,1);
+    assert.equal(f.state.count,1);
+    assert.equal(f.editor.value,'');
+    assert.equal(f.ctx.isSubmitting,false);
+    assert.equal(f.ctx.awaitingReply,true);
+    assert.deepEqual(f.state.errors,[]);
+});
+
+test('manual retry submits matching existing draft without inserting it again',()=>{
+    const f=submissionFixture({draft:'Continue'});
+    f.ctx.runContinueNow(true);f.drain();
+    assert.equal(f.state.insertions,0);
+    assert.equal(f.state.clicks,1);
+    assert.equal(f.state.count,1);
+});
+
+test('automatic send follows same confirmed submission flow',()=>{
+    const f=submissionFixture();
+    f.ctx.runContinueNow(false);f.drain();
+    assert.equal(f.state.clicks,1);
+    assert.equal(f.state.count,1);
+});
+
+test('unconfirmed click preserves draft and never clicks twice',()=>{
+    const f=submissionFixture({accept:false});
+    f.ctx.runContinueNow(true);f.drain();
+    assert.equal(f.state.clicks,1);
+    assert.equal(f.state.count,0);
+    assert.equal(f.editor.value,'Continue');
+    assert.equal(f.ctx.isSubmitting,false);
+    assert.match(f.state.errors[0],/не подтверждена/);
+});
+
+test('exception after draft insertion is surfaced instead of silently stopping',()=>{
+    const f=submissionFixture({setupThrows:true});
+    f.ctx.runContinueNow(true);f.drain();
+    assert.equal(f.editor.value,'Continue');
+    assert.equal(f.state.clicks,0);
+    assert.equal(f.ctx.isSubmitting,false);
+    assert.match(f.state.errors[0],/ReferenceError/);
+});
+
+test('delayed execution exception is surfaced and releases submission lock',()=>{
+    const f=submissionFixture();
+    f.ctx.runContinueNow(true);
+    f.ctx.getGenerationSignals=()=>{throw new TypeError('mock timer failure');};
+    f.drain();
+    assert.equal(f.editor.value,'Continue');
+    assert.equal(f.state.clicks,0);
+    assert.equal(f.ctx.isSubmitting,false);
+    assert.match(f.state.errors[0],/TypeError/);
+});
+
+test('production script contains no accidental secret-redaction placeholder',()=>{
+    assert.equal(source.includes('['+'REDACTED_SECRET'+']'),false);
+});

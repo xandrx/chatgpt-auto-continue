@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Auto Continue + Floating Panel
 // @namespace    http://tampermonkey.net/
-// @version      1.29
+// @version      1.30
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @description  Автопродолжение с проверкой активности текущего чата в боковой панели, защитой от ложного завершения, звуками и статистикой
@@ -1431,7 +1431,26 @@
         return signals.active || signals.staleSidebar;
     }
 
+    function handleSubmissionException(error) {
+        // Keep any unsent text and expose the actual failure instead of hanging.
+        lastSendStage = 'Ошибка отправки: ' + (error?.name || 'Error');
+        pendingOwnedDraft = null;
+        console.error('[ChatGPT Auto Continue] Submission failed', error);
+        pauseForUiFailure('error', lastSendStage);
+    }
+
+    function scheduleSendStep(step, delay) {
+        pendingSubmitTimerId = setTimeout(() => {
+            try { step(); } catch (error) { handleSubmissionException(error); }
+        }, delay);
+    }
+
     function runContinueNow(forceSend = false) {
+        try { performContinuation(forceSend); }
+        catch (error) { handleSubmissionException(error); }
+    }
+
+    function performContinuation(forceSend = false) {
         if (disposed || (!forceSend && !enabled)) return;
         if (forceSend) manualBlockUntil = 0;
         const signals = getGenerationSignals();
@@ -1477,14 +1496,14 @@
         const chatKeyAtStart = getConversationKey();
         pendingOwnedDraft = existingDraft ? null : { input, text: textToSend, chatKey: chatKeyAtStart };
         lastSendStage = 'Черновик готов';
-        const token= [REDACTED_SECRET];
+        const submissionId = ++pendingSubmitToken;
         isSubmitting = true;
         setStatus('Отправка...', 'send');
         setTabIndicator('working');
         const startedAt = Date.now();
 
         const attemptSend = () => {
-            if (disposed || token !== pendingSubmitToken ||
+            if (disposed || submissionId !== pendingSubmitToken ||
                 getConversationKey() !== chatKeyAtStart ||
                 (!forceSend && !enabled)) {
                 cancelPendingSend();
@@ -1514,7 +1533,7 @@
                 pendingOwnedDraft = null;
                 const clickedAt = Date.now();
                 const confirmSend = () => {
-                    if (disposed || token !== pendingSubmitToken ||
+                    if (disposed || submissionId !== pendingSubmitToken ||
                         getConversationKey() !== chatKeyAtStart) {
                         cancelPendingSend();
                         return;
@@ -1543,7 +1562,7 @@
                         pauseForUiFailure('warning', 'Отправка не подтверждена — проверьте черновик');
                         return;
                     }
-                    pendingSubmitTimerId = setTimeout(confirmSend, 200);
+                    scheduleSendStep(confirmSend, 200);
                 };
                 confirmSend();
                 return;
@@ -1554,9 +1573,9 @@
                 pauseForUiFailure('error', 'Кнопка отправки недоступна');
                 return;
             }
-            pendingSubmitTimerId = setTimeout(attemptSend, 200);
+            scheduleSendStep(attemptSend, 200);
         };
-        pendingSubmitTimerId = setTimeout(attemptSend, SUBMIT_DELAY_MS);
+        scheduleSendStep(attemptSend, SUBMIT_DELAY_MS);
     }
 
     function createFloatingPanel() {
