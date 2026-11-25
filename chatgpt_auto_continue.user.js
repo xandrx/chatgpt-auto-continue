@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Auto Continue + Floating Panel
 // @namespace    http://tampermonkey.net/
-// @version      1.31
+// @version      1.32
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @description  Auto-continue with conversation activity detection, submission verification, sound alerts and statistics
@@ -37,7 +37,7 @@
     const SUBMIT_DELAY_MS = 450;
     // Do not treat a quiet response as finished: thinking/tool calls can take minutes.
     const SEND_READY_TIMEOUT_MS = 5000;
-    const SEND_CONFIRM_TIMEOUT_MS = 8000;
+    const SEND_CONFIRM_TIMEOUT_MS = 15000;
     const RESPONSE_WAIT_TIMEOUT_MS = 90000;
     // The sidebar is a stronger positive indicator than the temporary Send button.
     // A response is complete only after ALL known activity signals stay quiet.
@@ -1398,11 +1398,34 @@
         };
     }
 
-    function isSubmissionConfirmed(before, after, expectedText, editorText, assistantAdvanced) {
+    function getAssistantSnapshot() {
+        const turns = getAssistantElements();
+        const last = turns[turns.length - 1];
+        return {
+            count: turns.length,
+            id: last?.getAttribute?.('data-message-id') || last?.getAttribute?.('data-dil-message-id') || '',
+            text: normalizeText(last?.textContent || '')
+        };
+    }
+
+    function hasAssistantAdvanced(before, after) {
+        return after.count > before.count ||
+            Boolean(after.id && after.id !== before.id) ||
+            Boolean(after.text && after.text !== before.text);
+    }
+
+    function isSubmissionConfirmed(before, after, expectedText, editorText, assistantAdvanced, stopAppeared = false) {
+        // Stop was absent immediately before our click. Its appearance proves
+        // that ChatGPT has begun processing, even if message nodes are reused.
+        if (stopAppeared) return true;
         const newUserTurn = after.count > before.count ||
             Boolean(after.id && after.id !== before.id);
-        return (newUserTurn && after.text === normalizeText(expectedText)) ||
-            (assistantAdvanced && !normalizeText(editorText));
+        const expected = normalizeText(expectedText);
+        const actual = normalizeText(after.text);
+        const draftCleared = !normalizeText(editorText);
+        const matchingUserTurn = newUserTurn && Boolean(expected) &&
+            (actual === expected || (draftCleared && actual.includes(expected)));
+        return matchingUserTurn || (assistantAdvanced && draftCleared);
     }
 
     function triggerSend() {
@@ -1636,8 +1659,15 @@
                 return;
             }
 
-            const assistantCount = getAssistantElements().length;
+            const assistantBefore = getAssistantSnapshot();
+            const assistantCount = assistantBefore.count;
             const userBefore = getUserMessageSnapshot();
+            const stopBefore = Boolean(getStopButton());
+            if (stopBefore) {
+                cancelPendingSend();
+                if (forceSend) showManualBlock('Генерация возобновилась');
+                return;
+            }
             if (triggerSend()) {
                 // Clicking is not confirmation. Do not clear the draft or click twice.
                 pendingOwnedDraft = null;
@@ -1649,22 +1679,26 @@
                         return;
                     }
                     const editorText = getComposerText(getComposerInput());
-                    const assistantAdvanced = getAssistantElements().length > assistantCount;
-                    if (isSubmissionConfirmed(userBefore, getUserMessageSnapshot(), textToSend, editorText, assistantAdvanced)) {
+                    const assistantAdvanced = hasAssistantAdvanced(assistantBefore, getAssistantSnapshot());
+                    const signals = getGenerationSignals();
+                    const stopAppeared = !stopBefore && signals.stopButton;
+                    const generationStarted = stopAppeared || assistantAdvanced ||
+                        (signals.replyFlag && !signals.staleReplyFlag && !normalizeText(editorText));
+                    if (isSubmissionConfirmed(userBefore, getUserMessageSnapshot(), textToSend, editorText, assistantAdvanced, stopAppeared)) {
                         lastSendStage = 'Отправка подтверждена';
                         completionCandidateSinceMs = 0;
                         hasCompletedOnce = false;
                         submittedAssistantCount = assistantCount;
                         submittedAtMs = clickedAt;
                         tabRequestStartedAtMs = clickedAt;
-                        awaitingReply = !assistantAdvanced;
-                        wasGenerating = assistantAdvanced;
+                        awaitingReply = !generationStarted;
+                        wasGenerating = generationStarted;
                         stopNotifiedForCurrentReply = false;
                         isSubmitting = false;
                         pendingSubmitTimerId = null;
                         recordContinuationSent();
                         try { playTickSound(); } catch (_) {}
-                        setStatus('Ожидание ответа...', 'idle');
+                        setStatus(generationStarted ? 'Генерация...' : 'Ожидание ответа...', generationStarted ? 'gen' : 'idle');
                         return;
                     }
                     if (Date.now() - clickedAt >= SEND_CONFIRM_TIMEOUT_MS) {
@@ -2235,7 +2269,9 @@
 
         // A new assistant message confirms a successfully submitted continuation.
         // Sidebar activity alone is not proof that the new message was accepted.
-        if (awaitingReply && getAssistantElements().length > submittedAssistantCount) {
+        if (awaitingReply && (signals.stopButton || signals.recentActivity ||
+            (signals.replyFlag && !signals.staleReplyFlag) ||
+            getAssistantElements().length > submittedAssistantCount)) {
             awaitingReply = false;
             wasGenerating = true;
         }

@@ -4,7 +4,7 @@
 
 A **Tampermonkey userscript** that automatically continues a [ChatGPT](https://chatgpt.com/) conversation once the assistant has finished responding. It provides a compact floating control panel, configurable stop word, session statistics, and safeguards against sending a follow-up while a response is still being generated.
 
-**Current version:** 1.31  
+**Current version:** 1.32  
 **Interface language:** English (default) / Russian  
 **Supported website:** `https://chatgpt.com/*`
 
