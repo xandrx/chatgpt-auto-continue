@@ -4,7 +4,7 @@
 
 A **Tampermonkey userscript** that automatically continues a [ChatGPT](https://chatgpt.com/) conversation once the assistant has finished responding. It provides a compact floating control panel, configurable stop word, session statistics, and safeguards against sending a follow-up while a response is still being generated.
 
-**Current version:** 1.24  
+**Current version:** 1.25  
 **Interface language:** Russian  
 **Supported website:** `https://chatgpt.com/*`
 
@@ -28,7 +28,7 @@ A **Tampermonkey userscript** that automatically continues a [ChatGPT](https://c
 - **Stop instruction:** Appends configurable stopping criteria to the continuation prompt. The `{STOP_WORD}` placeholder is replaced with the configured marker.
 - **Floating panel:** Enable/disable automation, manually send a message, collapse the panel, drag it, and save its position.
 - **Auto-scroll:** Follows new messages while respecting manual scrolling.
-- **Browser tab indicator:** Changes the tab title and favicon during generation and upon completion.
+- **Browser tab indicator:** Shows elapsed request time (`[MM:SS]` or `[HH:MM:SS]`), an orange favicon with animated dots when assistant content changes, and a green completion check. The completion badge clears after three seconds of continuous foreground focus.
 - **Sounds and statistics:** Notification sounds, continuation counter, elapsed time, and average cycle duration.
 - **Independent tabs (v1.21):** Each tab keeps its own on/off state and continuation statistics in `sessionStorage`, per conversation. Enabling a chat in one tab does not enable it in another separately opened tab.
 - **Shared prompt preferences:** Prompt text, stop instructions, and stop words remain stored per conversation in `localStorage`; changes to these preferences no longer reset another tab's generation or pending submission.
@@ -65,6 +65,14 @@ chatgpt-auto-continue/
 ```
 
 ## Changelog
+
+### v1.25 — Informative browser tabs
+
+- Replaced `[РАБОТАЕТ]` with a compact elapsed request timer (`[MM:SS]`, or `[HH:MM:SS]` for long requests). Each new request starts a new timer; manually initiated requests are timed from their first detection.
+- Animated the orange favicon only when changes in the latest assistant response are observed in the DOM. It returns to a steady icon after 2.4 seconds without observed updates. Silence is not a completion signal.
+- Removed redundant colored emoji from the title; color is represented by the favicon.
+- Automatically clears `[ГОТОВО]` and restores the normal favicon after three seconds of continuous visible, focused tab activity. Switching away resets the read delay; a new request resets the badge and timer.
+- Browser throttling may delay title and favicon updates in background tabs. The read badge is local to this userscript and does not alter ChatGPT's own unread state.
 
 ### v1.24 — Stuck generation signal recovery
 
