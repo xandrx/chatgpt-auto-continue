@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Auto Continue + Floating Panel
 // @namespace    http://tampermonkey.net/
-// @version      1.25
+// @version      1.26
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @description  Автопродолжение с проверкой активности текущего чата в боковой панели, защитой от ложного завершения, звуками и статистикой
@@ -95,6 +95,7 @@
     let tabLastActivityAtMs = null;
     let tabLastAssistantSnapshot = null;
     let tabReadFocusSinceMs = null;
+    let tabNotice = null;
     let lastFaviconKey = null;
     const badgeFaviconCache = new Map();
 
@@ -120,7 +121,7 @@
 
     function stripTabPrefix(title) {
         return String(title || '')
-            .replace(/^(?:(?:🟠|🟢|\?\?)\s*)?\[(?:РАБОТАЕТ|ГОТОВО|\d{2,}:\d{2}(?::\d{2})?)\]\s*/u, '')
+            .replace(/^(?:(?:🟠|🟢|\?\?)\s*)?\[(?:РАБОТАЕТ|ГОТОВО|СТОП|ЛИМИТ|ПРОВЕРКА|ОШИБКА|\d{2,}:\d{2}(?::\d{2})?)\]\s*/u, '')
             .replace(/^(?:🟠|🟢)\s*/u, '')
             .trim();
     }
@@ -158,7 +159,7 @@
     }
 
     function acknowledgeTabCompletion(now = Date.now()) {
-        if (tabIndicatorMode !== 'done' ||
+        if (!['done', 'stopped', 'limit', 'warning', 'error'].includes(tabIndicatorMode) ||
             document.visibilityState !== 'visible' || !document.hasFocus()) {
             resetTabReadFocus();
             return false;
@@ -166,8 +167,73 @@
         if (tabReadFocusSinceMs === null) tabReadFocusSinceMs = now;
         if (now - tabReadFocusSinceMs < TAB_READ_DELAY_MS) return false;
         hasCompletedOnce = false; // Don't recreate the badge on the next tick.
+        if (tabNotice) tabNotice.acknowledged = true;
         setTabIndicator(null);
         return true;
+    }
+
+    // Notice identity prevents persistent DOM signals from rearming a read badge.
+    function showTabNotice(mode, reason) {
+        const key = mode + ':' + reason;
+        hasCompletedOnce = false;
+        if (!tabNotice || tabNotice.key !== key) {
+            tabNotice = { key, mode, reason, acknowledged: false };
+            setTabIndicator(mode);
+        } else if (!tabNotice.acknowledged) {
+            setTabIndicator(mode);
+        }
+        setStatus(reason, 'stop');
+    }
+
+    function clearTabNotice() {
+        tabNotice = null;
+    }
+
+    function pauseForUiFailure(mode, reason) {
+        cancelPendingSend();
+        awaitingReply = false;
+        wasGenerating = false;
+        completionCandidateSinceMs = 0;
+        if (enabled) {
+            enabled = false;
+            enabledSinceMs = null;
+            persistCurrentSettings(true);
+            updateToggleUI();
+        }
+        showTabNotice(mode, reason);
+        acknowledgeTabCompletion();
+    }
+
+    // Only explicit application alerts; never infer quota/error from ordinary
+    // assistant prose. These UI phrases/selectors are best-effort, not an API.
+    function classifyUiFailure(text) {
+        const t = normalizeText(text);
+        if (!t) return null;
+        if (/(?:you(?:'|’| have )?ve? (?:reached|hit)|you have (?:reached|hit)|you (?:reached|hit))[^.!?]{0,100}(?:limit|quota)|(?:rate|usage|message) limit (?:reached|exceeded)|too many requests|(?:достиг(?:ли|нут)?|исчерпан(?:о)?)\s+(?:[^.!?]{0,50}\s+)?лимит|лимит[^.!?]{0,60}(?:исчерпан|достигнут)|слишком много запросов/iu.test(t)) {
+            return {mode:'limit', reason:'Лимит ChatGPT — выкл'};
+        }
+        if (/something went wrong|error (?:while |in )?generating (?:a |the )?response|network error|network connection lost|что-то пошло не так|ошибка (?:при )?генерации|ошибка сети|сетевая ошибка/iu.test(t)) {
+            return {mode:'error', reason:'Ошибка ChatGPT — выкл'};
+        }
+        return null;
+    }
+
+    function getExplicitUiFailure() {
+        const main = document.querySelector('main');
+        if (!main) return null;
+        const turns = getAssistantElements();
+        const latest = turns[turns.length - 1];
+        for (const el of main.querySelectorAll('[role="alert"], [data-testid="error-message"], [data-testid="rate-limit-message"]')) {
+            if (!el.isConnected || el.closest('#' + PANEL_ID + ', [hidden], [aria-hidden="true"], [inert]') ||
+                !el.getClientRects().length) continue;
+            const style = window.getComputedStyle(el);
+            if (style.visibility === 'hidden' || style.visibility === 'collapse' || style.display === 'none') continue;
+            const message = el.closest('[data-message-author-role]');
+            if (message && (!latest || (message !== latest && !message.contains(latest) && !latest.contains(message)))) continue;
+            const failure = classifyUiFailure(el.innerText || el.textContent || '');
+            if (failure) return failure;
+        }
+        return null;
     }
 
     function captureOriginalFavicons() {
@@ -202,8 +268,15 @@
             if (!ctx) return null;
 
             const isWorking = mode === 'working';
-            const bgColor = isWorking ? '#ea580c' : '#16a34a';
-            const ringColor = isWorking ? '#fdba74' : '#86efac';
+            const colors = {
+                working: ['#ea580c', '#fdba74'],
+                done: ['#16a34a', '#86efac'],
+                stopped: ['#ca8a04', '#fde047'],
+                limit: ['#ca8a04', '#fde047'],
+                warning: ['#ca8a04', '#fde047'],
+                error: ['#dc2626', '#fca5a5']
+            };
+            const [bgColor, ringColor] = colors[mode] || colors.done;
 
             ctx.beginPath();
             ctx.arc(32, 32, 28, 0, Math.PI * 2);
@@ -223,6 +296,19 @@
                     ctx.arc(dots[i], 32, phase === i ? 6.2 : 4.5, 0, Math.PI * 2);
                     ctx.fill();
                 }
+            } else if (mode === 'stopped') {
+                ctx.fillRect(21, 21, 22, 22);
+            } else if (mode === 'limit' || mode === 'warning' || mode === 'error') {
+                ctx.beginPath();
+                ctx.moveTo(32, 17);
+                ctx.lineTo(32, 33);
+                ctx.lineWidth = 7;
+                ctx.lineCap = 'round';
+                ctx.strokeStyle = '#ffffff';
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.arc(32, 44, 3.7, 0, Math.PI * 2);
+                ctx.fill();
             } else {
                 ctx.beginPath();
                 ctx.moveTo(19, 33);
@@ -296,6 +382,9 @@
             nextTitle = `[${formatTabElapsed(Date.now() - (tabRequestStartedAtMs ?? Date.now()))}] ${targetBase}`;
         } else if (mode === 'done') {
             nextTitle = `[ГОТОВО] ${targetBase}`;
+        } else if (['stopped', 'limit', 'warning', 'error'].includes(mode)) {
+            const labels = {stopped:'СТОП', limit:'ЛИМИТ', warning:'ПРОВЕРКА', error:'ОШИБКА'};
+            nextTitle = `[${labels[mode]}] ${targetBase}`;
         }
 
         if (document.title !== nextTitle) {
@@ -309,8 +398,9 @@
 
     function setTabIndicator(mode) {
         if (disposed) return;
-        const normalizedMode = mode === 'working' || mode === 'done' ? mode : null;
+        const normalizedMode = ['working', 'done', 'stopped', 'limit', 'warning', 'error'].includes(mode) ? mode : null;
         if (tabIndicatorMode !== normalizedMode) {
+            if (normalizedMode === 'working') clearTabNotice();
             tabRequestStartedAtMs = normalizedMode === 'working' ? Date.now() : null;
             tabLastActivityAtMs = null;
             resetTabReadFocus();
@@ -720,6 +810,7 @@
         submittedAssistantCount = 0;
         userScrolledAway = false;
         basePageTitle = stripTabPrefix(document.title) || null;
+        clearTabNotice();
         tabLastAssistantSnapshot = null;
         tabLastActivityAtMs = null;
         tabRequestStartedAtMs = null;
@@ -1174,15 +1265,13 @@
     function triggerStopWordDetected(disableAutoContinue = true) {
         completionCandidateSinceMs = 0;
         wasGenerating = false;
-        hasCompletedOnce = true;
-        setTabIndicator('done');
         if (disableAutoContinue) {
             enabled = false;
             enabledSinceMs = null;
             persistCurrentSettings(true);
         }
         updateToggleUI();
-        setStatus('Стоп-слово', 'stop');
+        showTabNotice('stopped', 'Стоп-слово');
         if (!stopNotifiedForCurrentReply) {
             stopNotifiedForCurrentReply = true;
             playStopBeepSound();
@@ -1228,6 +1317,13 @@
     function runContinueNow(forceSend = false) {
         if (disposed || isSubmitting || awaitingReply || getGenerationSignals().active ||
             (!forceSend && !enabled)) return;
+        const failure = getExplicitUiFailure();
+        if (failure) {
+            pauseForUiFailure(failure.mode, failure.reason);
+            return;
+        }
+        // An explicit retry may raise the same notice again if it fails.
+        clearTabNotice();
         const word = getActiveStopWord();
         if (!forceSend && hasStopWordInLastReply(word)) {
             triggerStopWordDetected(true);
@@ -1236,11 +1332,11 @@
 
         const input = getComposerInput();
         if (!input) {
-            setStatus('Поле ввода не найдено', 'stop');
+            showTabNotice('error', 'Поле ввода не найдено');
             return;
         }
         if (getComposerText(input).trim()) {
-            setStatus('Черновик не пуст — отправка отменена', 'stop');
+            showTabNotice('warning', 'Черновик не пуст — отправка отменена');
             return;
         }
 
@@ -1248,7 +1344,7 @@
             getActivePromptText(), getActiveStopPromptText(), word
         );
         if (!textToSend.trim() || !setComposerText(input, textToSend)) {
-            setStatus('Не удалось заполнить поле ввода', 'stop');
+            showTabNotice('error', 'Не удалось заполнить поле ввода');
             return;
         }
 
@@ -1267,10 +1363,15 @@
                 cancelPendingSend();
                 return;
             }
+            const failure = getExplicitUiFailure();
+            if (failure) {
+                pauseForUiFailure(failure.mode, failure.reason);
+                return;
+            }
             // The user may have modified the draft while waiting.
             if (normalizeText(getComposerText(input)) !== normalizeText(textToSend)) {
                 cancelPendingSend();
-                setStatus('Черновик изменён — отправка отменена', 'stop');
+                showTabNotice('warning', 'Черновик изменён — отправка отменена');
                 return;
             }
 
@@ -1294,7 +1395,7 @@
             }
             if (Date.now() - startedAt >= SEND_READY_TIMEOUT_MS) {
                 cancelPendingSend();
-                setStatus('Кнопка отправки недоступна', 'stop');
+                showTabNotice('error', 'Кнопка отправки недоступна');
                 return;
             }
             pendingSubmitTimerId = setTimeout(attemptSend, 200);
@@ -1785,16 +1886,7 @@
         // Never convert this state directly into an automatic continuation.
         // Pause automation and tell the user to verify the conversation.
         if (signals.staleReplyFlag) {
-            completionCandidateSinceMs = 0;
-            wasGenerating = false;
-            if (enabled) {
-                enabled = false;
-                enabledSinceMs = null;
-                persistCurrentSettings(true);
-                updateToggleUI();
-            }
-            setTabIndicator(null);
-            setStatus('Зависший busy · проверка', 'stop');
+            pauseForUiFailure('warning', 'Зависший busy · проверка');
             updateStatsUI();
             return;
         }
@@ -1825,6 +1917,19 @@
 
         sampleTabAssistantActivity(false, now);
 
+        // Do not treat a real generation as a failure just because an alert is
+        // temporarily mounted. Evaluate explicit UI failures only while idle,
+        // and only for a request or armed automation, or an already seen alert.
+        if (wasGenerating || awaitingReply || enabled ||
+            (tabNotice && /^(limit|error):.*ChatGPT/u.test(tabNotice.key))) {
+            const failure = getExplicitUiFailure();
+            if (failure) {
+                pauseForUiFailure(failure.mode, failure.reason);
+                updateStatsUI();
+                return;
+            }
+        }
+
         if (awaitingReply) {
             // Do NOT send another prompt after an unconfirmed submission.
             if (now - submittedAtMs > RESPONSE_WAIT_TIMEOUT_MS) {
@@ -1835,8 +1940,7 @@
                 enabledSinceMs = null;
                 persistCurrentSettings(true);
                 updateToggleUI();
-                setTabIndicator(null);
-                setStatus('Нет ответа — выкл', 'stop');
+                showTabNotice('error', 'Нет ответа — выкл');
             } else {
                 setTabIndicator('working');
                 setStatus('Ожидание ответа...', 'idle');
@@ -1880,6 +1984,14 @@
         }
 
         acknowledgeTabCompletion(now);
+
+        if (tabNotice) {
+            // Keep the detailed reason in the panel even after its tab badge
+            // has been acknowledged. A new request clears it.
+            setStatus(tabNotice.reason, 'stop');
+            updateStatsUI();
+            return;
+        }
 
         if (!enabled) {
             if (statusBadgeEl?.dataset.state !== 'stop') {
