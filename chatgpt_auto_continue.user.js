@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Auto Continue + Floating Panel
 // @namespace    http://tampermonkey.net/
-// @version      1.28
+// @version      1.29
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @description  Автопродолжение с проверкой активности текущего чата в боковой панели, защитой от ложного завершения, звуками и статистикой
@@ -881,26 +881,24 @@
 
     function getStopButton() {
         const root = getComposerRoot();
-        // Only the composer Stop action proves an active response. Loose
-        // includes('stop') previously matched unrelated controls such as
-        // "Stop recording", and hidden buttons could survive in the DOM.
-        const candidates = root
-            ? [...root.querySelectorAll('button')]
-            : [...document.querySelectorAll('button[data-composer-stop="true"], button[data-testid="stop-button"]')];
-
+        const editor = getComposerInput();
+        // The stop control can sit outside the form in the surrounding composer.
+        const layout = editor?.closest('[data-composer-layout], [class*="ComposerLayoutRoot"]');
+        const explicit = 'button[data-composer-stop="true"], button[data-testid="stop-button"], button[data-testid="composer-stop-button"]';
+        const candidates = new Set([
+            ...(root?.querySelectorAll('button') || []),
+            ...(layout?.querySelectorAll('button') || []),
+            ...document.querySelectorAll(explicit),
+            ...document.querySelectorAll('button#composer-submit-button, main button[aria-label], main button[title]')
+        ]);
         for (const btn of candidates) {
             const testId = (btn.getAttribute('data-testid') || '').toLowerCase();
-            const aria = (btn.getAttribute('aria-label') || '').trim();
+            const labels = [btn.getAttribute('aria-label'), btn.getAttribute('title'), btn.getAttribute('data-tooltip-content')];
             const isStop = btn.getAttribute('data-composer-stop') === 'true' ||
                 testId === 'stop-button' || testId === 'composer-stop-button' ||
-                /^(?:stop(?: generating| generation| response)?|остановить(?: генерацию| ответ)?)$/iu.test(aria);
-
-            if (!isStop || !btn.isConnected || btn.closest('[hidden], [aria-hidden="true"], [inert]') ||
-                btn.getAttribute('aria-hidden') === 'true' || !btn.getClientRects().length) continue;
-
-            const style = window.getComputedStyle(btn);
-            if (style.display !== 'none' && style.visibility !== 'hidden' &&
-                style.visibility !== 'collapse' && style.opacity !== '0') return btn;
+                labels.some(label => /^(?:stop(?: generating| generation| response| streaming| reasoning| thinking)?|остановить(?: генерацию| ответ| рассуждение| размышление)?)$/iu.test((label || '').trim()));
+            // Reject hidden duplicates and unrelated Stop recording controls.
+            if (isStop && isVisibleControl(btn)) return btn;
         }
         return null;
     }
@@ -919,13 +917,22 @@
     function getAssistantStreamingFlag() {
         const turns = getAssistantElements();
         const lastTurn = turns[turns.length - 1] || null;
-        // A single leftover aria-busy/data-is-streaming attribute is weaker
-        // evidence than the real Stop button or the matching sidebar spinner.
-        const active = Boolean(lastTurn && (
-            lastTurn.getAttribute('data-is-streaming') === 'true' ||
-            lastTurn.getAttribute('aria-busy') === 'true'
-        ));
+        if (!lastTurn) return { active: false, lastTurn };
+        const selector = '[data-is-streaming="true"], [aria-busy="true"], [data-streaming="true"]';
+        // Streaming markers can be placed on a turn wrapper or response body.
+        const wrapper = lastTurn.closest('article, [data-testid^="conversation-turn-"]') || lastTurn;
+        const active = Boolean(lastTurn.matches(selector) || wrapper.matches(selector) ||
+            lastTurn.querySelector(selector) || wrapper.querySelector(selector));
         return { active, lastTurn };
+    }
+
+    function hasUnansweredUserTurn() {
+        const users = document.querySelectorAll('[data-message-author-role="user"]');
+        const user = users[users.length - 1];
+        if (!user) return false;
+        const assistants = getAssistantElements();
+        const assistant = assistants[assistants.length - 1];
+        return !assistant || Boolean(user.compareDocumentPosition(assistant) & Node.DOCUMENT_POSITION_PRECEDING);
     }
 
     // Resolve the sidebar indicator for THIS conversation only. A spinner in a
@@ -982,6 +989,7 @@
     function getGenerationSignals() {
         const sidebar = getCurrentSidebarGenerationState();
         const stopButton = Boolean(getStopButton());
+        const unansweredUserTurn = hasUnansweredUserTurn();
         const { active: replyFlag, lastTurn } = getAssistantStreamingFlag();
         const send = getSendButton();
         const sendReady = Boolean(send && send.isConnected && !send.disabled &&
@@ -1001,7 +1009,7 @@
         }
         assistantActivityFingerprint = fingerprint;
         const recentActivity = assistantActivityAt !== null && now - assistantActivityAt < TAB_ACTIVITY_WINDOW_MS;
-        if (sidebar === 'working' && !stopButton && !replyFlag && composerEditable && lastTurn) {
+        if (sidebar === 'working' && !stopButton && !replyFlag && !unansweredUserTurn && composerEditable && lastTurn) {
             if (sidebarOnlySinceMs === null || sidebarOnlyFingerprint !== fingerprint) {
                 sidebarOnlySinceMs = now;
                 sidebarOnlyFingerprint = fingerprint;
@@ -1037,13 +1045,14 @@
             staleSidebar,
             sidebarOnlyMs: sidebarOnlySinceMs === null ? 0 : now - sidebarOnlySinceMs,
             recentActivity,
+            unansweredUserTurn,
             stopButton,
             replyFlag,
             staleReplyFlag,
             sendReady,
             composerEditable,
             // A stale sidebar is ambiguous, not proof of completion.
-            active: (sidebar === 'working' && !staleSidebar) || stopButton || recentActivity || (replyFlag && !staleReplyFlag)
+            active: (sidebar === 'working' && !staleSidebar) || stopButton || unansweredUserTurn || recentActivity || (replyFlag && !staleReplyFlag)
         };
     }
 
@@ -1099,6 +1108,13 @@
         return disabledCandidate;
     }
 
+    function updateStatusTooltip(diagnostics) {
+        if (!statusBadgeEl) return;
+        if (diagnostics !== undefined) statusBadgeEl.dataset.diagnostics = diagnostics;
+        statusBadgeEl.title = [statusBadgeEl.textContent, statusBadgeEl.dataset.diagnostics]
+            .filter(Boolean).join('\n\n');
+    }
+
     function setStatus(text, state = 'idle') {
         if (!statusBadgeEl) return;
 
@@ -1108,6 +1124,7 @@
         }
         statusBadgeEl.textContent = text;
         statusBadgeEl.dataset.state = state;
+        updateStatusTooltip();
 
         const colors = {
             idle: { bg: 'rgba(59, 130, 246, 0.16)', fg: '#93c5fd' },
@@ -1409,7 +1426,7 @@
     }
 
     function generationBlocksSend(signals, forceSend) {
-        if (signals.stopButton || signals.replyFlag || signals.recentActivity) return true;
+        if (signals.stopButton || signals.replyFlag || signals.recentActivity || signals.unansweredUserTurn) return true;
         if (forceSend && signals.composerEditable) return false;
         return signals.active || signals.staleSidebar;
     }
@@ -1558,6 +1575,7 @@
             'gap: 8px',
             'width: 312px',
             'max-width: calc(100vw - 24px)',
+            'box-sizing: border-box',
             'max-height: calc(100vh - 24px)',
             'overflow: auto',
             'padding: 9px 11px',
@@ -1574,7 +1592,7 @@
         ].join(';');
 
         const topRow = document.createElement('div');
-        topRow.style.cssText = 'display: flex; align-items: center; gap: 5px; justify-content: space-between;';
+        topRow.style.cssText = 'display: flex; align-items: center; gap: 4px; min-width: 0; max-width: 100%; flex-shrink: 0;';
 
         const dragHandle = document.createElement('span');
         dragHandle.title = 'Перетащить панель';
@@ -1588,7 +1606,10 @@
             'font-size: 11px',
             'font-weight: 500',
             'white-space: nowrap',
-            'margin-right: auto'
+            'flex: 1 1 auto',
+            'min-width: 0',
+            'overflow: hidden',
+            'text-overflow: ellipsis'
         ].join(';');
 
         compactCountEl = document.createElement('span');
@@ -1897,6 +1918,10 @@
         document.addEventListener('mousemove', onMouseMove);
         document.addEventListener('mouseup', onMouseUp);
 
+        // Reserve the width of every control; only the status may shrink.
+        for (const control of [dragHandle, compactCountEl, scrollBtnEl, soundBtnEl, sendNowBtnEl, toggleBtnEl, collapseBtnEl]) {
+            control.style.flex = '0 0 auto';
+        }
         topRow.appendChild(dragHandle);
         topRow.appendChild(statusBadgeEl);
         topRow.appendChild(compactCountEl);
@@ -2001,7 +2026,7 @@
 
         if (isSubmitting) {
             setStatus('Отправка...', 'send');
-            if (statusBadgeEl) statusBadgeEl.title = 'Отправка: ' + lastSendStage;
+            updateStatusTooltip('Отправка: ' + lastSendStage);
             setTabIndicator('working');
             updateStatsUI();
             return;
@@ -2010,19 +2035,20 @@
         const signals = getGenerationSignals();
         const now = Date.now();
         if (statusBadgeEl) {
-            statusBadgeEl.title = [
+            updateStatusTooltip([
                 'Генерация — диагностика',
                 'Отправка: ' + lastSendStage,
                 'Sidebar: ' + signals.sidebar,
                 'Sidebar устарел: ' + (signals.staleSidebar ? 'да' : 'нет'),
                 'Sidebar без подтверждения: ' + Math.floor(signals.sidebarOnlyMs / 1000) + 'с',
                 'Недавнее изменение ответа: ' + (signals.recentActivity ? 'да' : 'нет'),
+                'Запрос без ответа: ' + (signals.unansweredUserTurn ? 'да' : 'нет'),
                 'Кнопка Stop: ' + (signals.stopButton ? 'да' : 'нет'),
                 'Атрибут busy: ' + (signals.replyFlag ? 'да' : 'нет'),
                 'Busy устарел: ' + (signals.staleReplyFlag ? 'да' : 'нет'),
                 'Отправка доступна: ' + (signals.sendReady ? 'да' : 'нет'),
                 'Редактор доступен: ' + (signals.composerEditable ? 'да' : 'нет')
-            ].join('\n');
+            ].join('\n'));
         }
 
         // A stale reply flag is ambiguous: the user might have pressed Stop,
@@ -2047,6 +2073,15 @@
             wasGenerating = true;
         }
 
+        if (signals.unansweredUserTurn && !signals.stopButton && !signals.replyFlag && !signals.recentActivity) {
+            const failure = getExplicitUiFailure();
+            if (failure) {
+                pauseForUiFailure(failure.mode, failure.reason);
+                updateStatsUI();
+                return;
+            }
+        }
+
         if (signals.active) {
             completionCandidateSinceMs = 0;
             if (!wasGenerating) {
@@ -2059,7 +2094,8 @@
             setStatus(signals.sidebar === 'working' ? 'Генерация · чат'
                 : signals.stopButton ? 'Генерация · Stop'
                     : signals.recentActivity ? 'Генерация · текст'
-                        : 'Генерация · busy', 'gen');
+                        : signals.unansweredUserTurn ? 'Генерация · запрос'
+                            : 'Генерация · busy', 'gen');
             performAutoScroll();
             updateStatsUI();
             return;

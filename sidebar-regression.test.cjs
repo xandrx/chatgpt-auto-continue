@@ -24,6 +24,7 @@ function fixture() {
         weakBusySinceMs: 0, weakBusyTextFingerprint: null,
         getCurrentSidebarGenerationState: () => state.sidebar,
         getStopButton: () => state.stop,
+        hasUnansweredUserTurn: () => Boolean(state.unanswered),
         getAssistantStreamingFlag: () => ({active: state.busy, lastTurn: turn}),
         getAssistantElements: () => [turn],
         getSendButton: () => null,
@@ -118,4 +119,61 @@ test('finds enabled real send button even when preferred selector is disabled', 
     });
     vm.runInContext(functionSource('getSendButton'),ctx);
     assert.equal(ctx.getSendButton(),ready);
+});
+
+test('status tooltip preserves the full status and latest diagnostics', () => {
+    const statusBadgeEl = {textContent: 'Черновик не пуст — отправка отменена', dataset: {}};
+    const ctx = vm.createContext({statusBadgeEl});
+    vm.runInContext(functionSource('updateStatusTooltip'), ctx);
+    ctx.updateStatusTooltip('Sidebar: unknown');
+    assert.equal(statusBadgeEl.title, 'Черновик не пуст — отправка отменена\n\nSidebar: unknown');
+    statusBadgeEl.textContent = 'Ожидание';
+    ctx.updateStatusTooltip();
+    assert.equal(statusBadgeEl.title, 'Ожидание\n\nSidebar: unknown');
+    ctx.updateStatusTooltip('Отправка: клик');
+    assert.equal(statusBadgeEl.title, 'Ожидание\n\nОтправка: клик');
+});
+
+test('header status can shrink while action buttons retain their width', () => {
+    const header = functionSource('createFloatingPanel');
+    const statusStyle = header.split('statusBadgeEl.style.cssText = [')[1].split("].join(';')")[0];
+    assert.ok(statusStyle.includes("'min-width: 0'"));
+    assert.ok(statusStyle.includes("'overflow: hidden'"));
+    assert.ok(statusStyle.includes("'text-overflow: ellipsis'"));
+    assert.ok(statusStyle.includes("'flex: 1 1 auto'"));
+    assert.ok(header.includes("control.style.flex = '0 0 auto'"));
+});
+
+test('unanswered user turn blocks both manual and automatic sends, even with hidden sidebar', () => {
+    const f = fixture(); f.state.sidebar = 'unknown'; f.state.unanswered = true;
+    assert.equal(f.signals().active, true);
+    assert.equal(f.blocked(f.signals(), true), true);
+    assert.equal(f.blocked(f.signals(), false), true);
+    f.state.now += 180000;
+    assert.equal(f.signals().active, true);
+    f.state.unanswered = false;
+    assert.equal(f.signals().active, false);
+});
+
+test('finds a visible stop control outside composer form, rejects voice and hidden controls', () => {
+    const button = attrs => ({getAttribute: k => attrs[k] || null});
+    const voice = button({'aria-label':'Stop recording'});
+    const hidden = button({'data-testid':'stop-button'});
+    const stop = button({title:'Stop generating'});
+    const ctx = vm.createContext({
+        getComposerRoot:()=>({querySelectorAll:()=>[voice]}),
+        getComposerInput:()=>null,
+        document:{querySelectorAll:()=>[hidden,stop]},
+        isVisibleControl: btn => btn !== hidden
+    });
+    vm.runInContext(functionSource('getStopButton'),ctx);
+    assert.equal(ctx.getStopButton(),stop);
+});
+
+test('streaming indicator on assistant turn wrapper is recognized', () => {
+    const wrapper = {matches:()=>true,querySelector:()=>null};
+    const turn = {closest:()=>wrapper,matches:()=>false,querySelector:()=>null};
+    const ctx = vm.createContext({getAssistantElements:()=>[turn]});
+    vm.runInContext(functionSource('getAssistantStreamingFlag'),ctx);
+    assert.equal(ctx.getAssistantStreamingFlag().active,true);
 });
