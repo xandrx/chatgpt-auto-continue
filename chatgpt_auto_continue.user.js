@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Auto Continue + Floating Panel
 // @namespace    http://tampermonkey.net/
-// @version      1.27
+// @version      1.28
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @description  Автопродолжение с проверкой активности текущего чата в боковой панели, защитой от ложного завершения, звуками и статистикой
@@ -38,7 +38,8 @@
     const TAB_ACTIVITY_WINDOW_MS = 2400;
     const SUBMIT_DELAY_MS = 450;
     // Do not treat a quiet response as finished: thinking/tool calls can take minutes.
-    const SEND_READY_TIMEOUT_MS = 3000;
+    const SEND_READY_TIMEOUT_MS = 5000;
+    const SEND_CONFIRM_TIMEOUT_MS = 8000;
     const RESPONSE_WAIT_TIMEOUT_MS = 90000;
     // The sidebar is a stronger positive indicator than the temporary Send button.
     // A response is complete only after ALL known activity signals stay quiet.
@@ -79,6 +80,7 @@
     let pendingSubmitTimerId = null;
     let pendingSubmitToken = 0;
     let pendingOwnedDraft = null;
+    let lastSendStage = 'Нет попыток';
     let completionCandidateSinceMs = 0;
     let weakBusySinceMs = 0;
     let weakBusyTextFingerprint = null;
@@ -799,6 +801,7 @@
             saveTabChatState(currentChatKey);
         }
         currentChatKey = nextKey;
+        lastSendStage = 'Нет попыток';
         sidebarOnlySinceMs = null;
         sidebarOnlyFingerprint = null;
         assistantActivityFingerprint = null;
@@ -1078,18 +1081,22 @@
         const root = getComposerRoot();
         if (!root) return null;
         const selectors = [
-            'button[data-testid="send-button"], button#composer-submit-button, button[data-composer-submit="true"]',
+            'button[data-testid="send-button"]',
+            'button#composer-submit-button',
+            'button[data-composer-submit="true"]',
             'button[aria-label="Отправить"], button[aria-label="Отправить сообщение"], button[aria-label="Send"], button[aria-label="Send message"]',
             '[data-composer-trailing-controls="true"] button.bg-composer-primary:not([data-composer-voice-start="true"])'
         ];
+        let disabledCandidate = null;
         for (const selector of selectors) {
             const candidates = [...root.querySelectorAll(selector)].filter(btn =>
                 isVisibleControl(btn) && !btn.matches('[data-composer-stop="true"], [data-composer-voice-start="true"], [data-testid="stop-button"]') &&
                 !/stop|voice|останов|голос/iu.test(btn.getAttribute('aria-label') || ''));
             const ready = candidates.find(btn => !btn.disabled && btn.getAttribute('aria-disabled') !== 'true');
-            if (ready || candidates.length) return ready || candidates[0];
+            if (ready) return ready;
+            if (!disabledCandidate && candidates.length) disabledCandidate = candidates[0];
         }
-        return null;
+        return disabledCandidate;
     }
 
     function setStatus(text, state = 'idle') {
@@ -1228,7 +1235,6 @@
             return composerContainsExpectedText(el, value);
         };
 
-        if (attempt(() => document.execCommand('insertText', false, value))) return true;
         // Clipboard paste is handled by ProseMirror and preserves multiline text.
         if (attempt(() => {
             if (typeof DataTransfer === 'undefined' || typeof ClipboardEvent === 'undefined') return;
@@ -1240,6 +1246,7 @@
                 clipboardData: data
             }));
         })) return true;
+        if (attempt(() => document.execCommand('insertText', false, value))) return true;
 
         // Some Chromium editor versions accept HTML insertion but not plain
         // insertText. Escape all user-supplied content before building markup.
@@ -1254,11 +1261,29 @@
         return false;
     }
 
+    function getUserMessageSnapshot() {
+        const messages = [...document.querySelectorAll('[data-message-author-role="user"]')];
+        const last = messages[messages.length - 1];
+        return {
+            count: messages.length,
+            id: last?.getAttribute('data-message-id') || last?.getAttribute('data-dil-message-id') || '',
+            text: normalizeText(last?.innerText || last?.textContent || '')
+        };
+    }
+
+    function isSubmissionConfirmed(before, after, expectedText, editorText, assistantAdvanced) {
+        const newUserTurn = after.count > before.count ||
+            Boolean(after.id && after.id !== before.id);
+        return (newUserTurn && after.text === normalizeText(expectedText)) ||
+            (assistantAdvanced && !normalizeText(editorText));
+    }
+
     function triggerSend() {
         const sendBtn = getSendButton();
         if (!sendBtn || !sendBtn.isConnected || sendBtn.disabled ||
             sendBtn.getAttribute('aria-disabled') === 'true') return false;
         try {
+            lastSendStage = 'Клик: ' + (sendBtn.getAttribute('data-testid') || sendBtn.id || sendBtn.getAttribute('aria-label') || 'composer');
             sendBtn.click();
             return true;
         } catch (_) {
@@ -1418,21 +1443,23 @@
             showTabNotice('error', 'Поле ввода не найдено');
             return;
         }
-        if (getComposerText(input).trim()) {
-            showTabNotice('warning', 'Черновик не пуст — отправка отменена');
-            return;
-        }
-
         const textToSend = buildFullPrompt(
             getActivePromptText(), getActiveStopPromptText(), word
         );
-        if (!textToSend.trim() || !setComposerText(input, textToSend)) {
+        const existingDraft = getComposerText(input).trim();
+        if (existingDraft && (!forceSend || !composerContainsExpectedText(input, textToSend))) {
+            showTabNotice('warning', 'Черновик не пуст — отправка отменена');
+            return;
+        }
+        lastSendStage = existingDraft ? 'Повтор: готовый черновик' : 'Заполнение редактора';
+        if (!textToSend.trim() || (!existingDraft && !setComposerText(input, textToSend))) {
             showTabNotice('error', 'Не удалось заполнить поле ввода');
             return;
         }
 
-        const chatKeyAtStart = currentChatKey;
-        pendingOwnedDraft = { input, text: textToSend, chatKey: chatKeyAtStart };
+        const chatKeyAtStart = getConversationKey();
+        pendingOwnedDraft = existingDraft ? null : { input, text: textToSend, chatKey: chatKeyAtStart };
+        lastSendStage = 'Черновик готов';
         const token= [REDACTED_SECRET];
         isSubmitting = true;
         setStatus('Отправка...', 'send');
@@ -1457,33 +1484,57 @@
                 return;
             }
             // The user may have modified the draft while waiting.
-            if (normalizeText(getComposerText(input)) !== normalizeText(textToSend)) {
+            if (!composerContainsExpectedText(getComposerInput(), textToSend)) {
                 cancelPendingSend();
                 showTabNotice('warning', 'Черновик изменён — отправка отменена');
                 return;
             }
 
             const assistantCount = getAssistantElements().length;
+            const userBefore = getUserMessageSnapshot();
             if (triggerSend()) {
+                // Clicking is not confirmation. Do not clear the draft or click twice.
                 pendingOwnedDraft = null;
-                completionCandidateSinceMs = 0;
-                hasCompletedOnce = false;
-                submittedAssistantCount = assistantCount;
-                submittedAtMs = Date.now();
-                tabRequestStartedAtMs = submittedAtMs;
-                awaitingReply = true;
-                wasGenerating = false;
-                stopNotifiedForCurrentReply = false;
-                recordContinuationSent();
-                try { playTickSound(); } catch (_) {}
-                isSubmitting = false;
-                pendingSubmitTimerId = null;
-                setStatus('Ожидание ответа...', 'idle');
+                const clickedAt = Date.now();
+                const confirmSend = () => {
+                    if (disposed || token !== pendingSubmitToken ||
+                        getConversationKey() !== chatKeyAtStart) {
+                        cancelPendingSend();
+                        return;
+                    }
+                    const editorText = getComposerText(getComposerInput());
+                    const assistantAdvanced = getAssistantElements().length > assistantCount;
+                    if (isSubmissionConfirmed(userBefore, getUserMessageSnapshot(), textToSend, editorText, assistantAdvanced)) {
+                        lastSendStage = 'Отправка подтверждена';
+                        completionCandidateSinceMs = 0;
+                        hasCompletedOnce = false;
+                        submittedAssistantCount = assistantCount;
+                        submittedAtMs = clickedAt;
+                        tabRequestStartedAtMs = clickedAt;
+                        awaitingReply = !assistantAdvanced;
+                        wasGenerating = assistantAdvanced;
+                        stopNotifiedForCurrentReply = false;
+                        isSubmitting = false;
+                        pendingSubmitTimerId = null;
+                        recordContinuationSent();
+                        try { playTickSound(); } catch (_) {}
+                        setStatus('Ожидание ответа...', 'idle');
+                        return;
+                    }
+                    if (Date.now() - clickedAt >= SEND_CONFIRM_TIMEOUT_MS) {
+                        lastSendStage = 'Клик без подтверждения';
+                        pauseForUiFailure('warning', 'Отправка не подтверждена — проверьте черновик');
+                        return;
+                    }
+                    pendingSubmitTimerId = setTimeout(confirmSend, 200);
+                };
+                confirmSend();
                 return;
             }
             if (Date.now() - startedAt >= SEND_READY_TIMEOUT_MS) {
-                cancelPendingSend();
-                showTabNotice('error', 'Кнопка отправки недоступна');
+                lastSendStage = 'Кнопка отправки недоступна';
+                pendingOwnedDraft = null; // Preserve the draft for manual recovery.
+                pauseForUiFailure('error', 'Кнопка отправки недоступна');
                 return;
             }
             pendingSubmitTimerId = setTimeout(attemptSend, 200);
@@ -1950,6 +2001,7 @@
 
         if (isSubmitting) {
             setStatus('Отправка...', 'send');
+            if (statusBadgeEl) statusBadgeEl.title = 'Отправка: ' + lastSendStage;
             setTabIndicator('working');
             updateStatsUI();
             return;
@@ -1960,6 +2012,7 @@
         if (statusBadgeEl) {
             statusBadgeEl.title = [
                 'Генерация — диагностика',
+                'Отправка: ' + lastSendStage,
                 'Sidebar: ' + signals.sidebar,
                 'Sidebar устарел: ' + (signals.staleSidebar ? 'да' : 'нет'),
                 'Sidebar без подтверждения: ' + Math.floor(signals.sidebarOnlyMs / 1000) + 'с',

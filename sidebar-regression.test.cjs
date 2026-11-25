@@ -91,3 +91,31 @@ test('visibility rejects hidden, clipped, offscreen and disconnected rows', () =
     clipped.style.overflowX = 'hidden';
     assert.equal(ctx.isVisibleControl(el({parentElement:clipped})), false);
 });
+
+test('click or unchanged previous user turn is not confirmation', () => {
+    const ctx = vm.createContext({normalizeText: value => String(value || '').trim().replace(/\s+/g, ' ')});
+    vm.runInContext(functionSource('isSubmissionConfirmed'), ctx);
+    const before = {count: 4, id: 'old', text: 'Continue'};
+    assert.equal(ctx.isSubmissionConfirmed(before, before, 'Continue', 'Continue', false), false);
+    assert.equal(ctx.isSubmissionConfirmed(before, before, 'Continue', '', false), false);
+    assert.equal(ctx.isSubmissionConfirmed(before, {count:5,id:'new',text:'Different'}, 'Continue', '', false), false);
+    assert.equal(ctx.isSubmissionConfirmed(before, {count:5,id:'new',text:'Continue'}, 'Continue', '', false), true);
+    assert.equal(ctx.isSubmissionConfirmed(before, {count:4,id:'new',text:'Continue'}, 'Continue', '', false), true);
+    assert.equal(ctx.isSubmissionConfirmed(before, before, 'Continue', 'Continue', true), false);
+    assert.equal(ctx.isSubmissionConfirmed(before, before, 'Continue', '', true), true);
+});
+
+test('finds enabled real send button even when preferred selector is disabled', () => {
+    const disabled = {disabled:true, matches:()=>false,getAttribute:()=>null};
+    const ready = {disabled:false,matches:()=>false,getAttribute:()=>null};
+    const hidden = {disabled:false,matches:()=>false,getAttribute:()=>null};
+    const stop = {disabled:false,matches:()=>true,getAttribute:()=>null};
+    const ctx = vm.createContext({
+        isVisibleControl: btn => btn !== hidden,
+        getComposerRoot:()=>({querySelectorAll: selector =>
+            selector === 'button[data-testid="send-button"]' ? [hidden,disabled,stop] :
+            selector === 'button#composer-submit-button' ? [ready] : []})
+    });
+    vm.runInContext(functionSource('getSendButton'),ctx);
+    assert.equal(ctx.getSendButton(),ready);
+});
