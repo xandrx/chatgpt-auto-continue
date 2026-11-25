@@ -4,7 +4,7 @@
 
 A **Tampermonkey userscript** that automatically continues a [ChatGPT](https://chatgpt.com/) conversation once the assistant has finished responding. It provides a compact floating control panel, configurable stop word, session statistics, and safeguards against sending a follow-up while a response is still being generated.
 
-**Current version:** 1.25  
+**Current version:** 1.26  
 **Interface language:** Russian  
 **Supported website:** `https://chatgpt.com/*`
 
@@ -65,6 +65,14 @@ chatgpt-auto-continue/
 ```
 
 ## Changelog
+
+### v1.26 — Actionable tab alerts
+
+- Added yellow stop, quota and verification badges (`[СТОП]`, `[ЛИМИТ]`, `[ПРОВЕРКА]`) and a red error badge (`[ОШИБКА]`).
+- Reports stop words, stale generation flags, submission failures, unconfirmed responses and conflicting drafts.
+- Detects recognizable English and Russian quota/error messages in explicit visible ChatGPT UI alerts, not ordinary assistant text. Detection is best-effort and depends on the current interface.
+- Explicit ChatGPT failures pause automation instead of sending another prompt. Strong generation signals retain priority.
+- Notices clear from the tab title and favicon after three seconds of continuous foreground focus. A persistent identical alert does not rearm its badge; the reason remains in the panel until a new attempt or generation.
 
 ### v1.25 — Informative browser tabs
 
