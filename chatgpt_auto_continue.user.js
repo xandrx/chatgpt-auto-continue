@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Auto Continue + Floating Panel
 // @namespace    http://tampermonkey.net/
-// @version      1.26
+// @version      1.27
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @description  Автопродолжение с проверкой активности текущего чата в боковой панели, защитой от ложного завершения, звуками и статистикой
@@ -48,6 +48,7 @@
     // the sidebar explicitly says idle and the composer is ready.
     const UNCORROBORATED_BUSY_STALE_MS = 45000;
     const UNCERTAIN_BUSY_STALE_MS = 120000;
+    const SIDEBAR_STALE_MS = 30000;
 
     const STORAGE_DEFAULTS_KEY = 'cgpt_autocont_defaults_v4';
     const STORAGE_CHATS_KEY = 'cgpt_autocont_chats_v4';
@@ -81,6 +82,12 @@
     let completionCandidateSinceMs = 0;
     let weakBusySinceMs = 0;
     let weakBusyTextFingerprint = null;
+    let sidebarOnlySinceMs = null;
+    let sidebarOnlyFingerprint = null;
+    let assistantActivityFingerprint = null;
+    let assistantActivityAt = null;
+    let manualBlockUntil = 0;
+    let manualBlockReason = '';
     let userScrolledAway = false;
     let lastScrollTop = 0;
 
@@ -792,6 +799,12 @@
             saveTabChatState(currentChatKey);
         }
         currentChatKey = nextKey;
+        sidebarOnlySinceMs = null;
+        sidebarOnlyFingerprint = null;
+        assistantActivityFingerprint = null;
+        assistantActivityAt = null;
+        manualBlockUntil = 0;
+        manualBlockReason = '';
         weakBusySinceMs = 0;
         weakBusyTextFingerprint = null;
         const cfg = getChatConfig(currentChatKey);
@@ -915,6 +928,31 @@
     // Resolve the sidebar indicator for THIS conversation only. A spinner in a
     // different chat must never block this one. The row can disappear when the
     // sidebar is collapsed or virtualized; that means "unknown", not "idle".
+    function isVisibleControl(el) {
+        if (!el?.isConnected || !el.getClientRects().length ||
+            el.closest('[hidden], [aria-hidden="true"], [inert]')) return false;
+        const rect = el.getBoundingClientRect();
+        let left = Math.max(0, rect.left), right = Math.min(window.innerWidth, rect.right);
+        let top = Math.max(0, rect.top), bottom = Math.min(window.innerHeight, rect.bottom);
+        for (let node = el; node; node = node.parentElement) {
+            const style = window.getComputedStyle(node);
+            if (style.display === 'none' || style.visibility === 'hidden' ||
+                style.visibility === 'collapse' || style.opacity === '0' ||
+                style.contentVisibility === 'hidden') return false;
+            if (node === el) continue;
+            const bounds = node.getBoundingClientRect();
+            if (/hidden|clip|scroll|auto/.test(style.overflowX)) {
+                left = Math.max(left, bounds.left);
+                right = Math.min(right, bounds.right);
+            }
+            if (/hidden|clip|scroll|auto/.test(style.overflowY)) {
+                top = Math.max(top, bounds.top);
+                bottom = Math.min(bottom, bounds.bottom);
+            }
+        }
+        return right > left && bottom > top;
+    }
+
     function getCurrentSidebarGenerationState() {
         const match = getConversationKey().match(/^chat:([a-zA-Z0-9_-]+)$/);
         if (!match) return 'unknown';
@@ -923,7 +961,7 @@
         const row =
             document.querySelector(`[data-sidebar-archive-chatgpt-id="${chatId}"]`) ||
             document.querySelector(`[data-sidebar-chatgpt-conversation-key="chatgpt:conversation:${chatId}"]`);
-        if (!row) return 'unknown';
+        if (!isVisibleControl(row)) return 'unknown';
 
         const indicator = row.matches('[data-sidebar-indicator]')
             ? row
@@ -952,6 +990,24 @@
             (typeof editor.value === 'string' || editor.isContentEditable ||
              editor.getAttribute('contenteditable') === 'true'));
         let staleReplyFlag = false;
+        let staleSidebar = false;
+        const now = Date.now();
+        const fingerprint = getAssistantElements().length + ':' + (lastTurn?.textContent || '');
+        if (assistantActivityFingerprint !== null && lastTurn && assistantActivityFingerprint !== fingerprint) {
+            assistantActivityAt = now;
+        }
+        assistantActivityFingerprint = fingerprint;
+        const recentActivity = assistantActivityAt !== null && now - assistantActivityAt < TAB_ACTIVITY_WINDOW_MS;
+        if (sidebar === 'working' && !stopButton && !replyFlag && composerEditable && lastTurn) {
+            if (sidebarOnlySinceMs === null || sidebarOnlyFingerprint !== fingerprint) {
+                sidebarOnlySinceMs = now;
+                sidebarOnlyFingerprint = fingerprint;
+            }
+            staleSidebar = now - sidebarOnlySinceMs >= SIDEBAR_STALE_MS;
+        } else {
+            sidebarOnlySinceMs = null;
+            sidebarOnlyFingerprint = null;
+        }
 
         // ChatGPT sometimes leaves a response attribute "busy" after an
         // interrupted reply. Clear only this weak signal (never a real Stop
@@ -975,14 +1031,16 @@
 
         return {
             sidebar,
+            staleSidebar,
+            sidebarOnlyMs: sidebarOnlySinceMs === null ? 0 : now - sidebarOnlySinceMs,
+            recentActivity,
             stopButton,
             replyFlag,
             staleReplyFlag,
             sendReady,
             composerEditable,
-            // Strong signals always win. In particular, a briefly enabled
-            // Send button MUST NOT override a working sidebar indicator.
-            active: sidebar === 'working' || stopButton || (replyFlag && !staleReplyFlag)
+            // A stale sidebar is ambiguous, not proof of completion.
+            active: (sidebar === 'working' && !staleSidebar) || stopButton || recentActivity || (replyFlag && !staleReplyFlag)
         };
     }
 
@@ -1019,23 +1077,28 @@
     function getSendButton() {
         const root = getComposerRoot();
         if (!root) return null;
-        const explicitSend =
-            root.querySelector('button[data-testid="send-button"]') ||
-            root.querySelector('button[data-composer-submit="true"]') ||
-            root.querySelector('button[aria-label*="Отправить"]') ||
-            root.querySelector('button[aria-label*="Send"]');
-
-        if (explicitSend) return explicitSend;
-
-        const trailingPrimary = root.querySelector(
+        const selectors = [
+            'button[data-testid="send-button"], button#composer-submit-button, button[data-composer-submit="true"]',
+            'button[aria-label="Отправить"], button[aria-label="Отправить сообщение"], button[aria-label="Send"], button[aria-label="Send message"]',
             '[data-composer-trailing-controls="true"] button.bg-composer-primary:not([data-composer-voice-start="true"])'
-        );
-        return trailingPrimary || null;
+        ];
+        for (const selector of selectors) {
+            const candidates = [...root.querySelectorAll(selector)].filter(btn =>
+                isVisibleControl(btn) && !btn.matches('[data-composer-stop="true"], [data-composer-voice-start="true"], [data-testid="stop-button"]') &&
+                !/stop|voice|останов|голос/iu.test(btn.getAttribute('aria-label') || ''));
+            const ready = candidates.find(btn => !btn.disabled && btn.getAttribute('aria-disabled') !== 'true');
+            if (ready || candidates.length) return ready || candidates[0];
+        }
+        return null;
     }
 
     function setStatus(text, state = 'idle') {
         if (!statusBadgeEl) return;
 
+        if (Date.now() < manualBlockUntil && state !== 'send') {
+            text = manualBlockReason;
+            state = 'stop';
+        }
         statusBadgeEl.textContent = text;
         statusBadgeEl.dataset.state = state;
 
@@ -1314,9 +1377,29 @@
         clearPendingOwnedDraft();
     }
 
+    function showManualBlock(reason) {
+        manualBlockReason = reason;
+        manualBlockUntil = Date.now() + 5000;
+        setStatus(reason, 'stop');
+    }
+
+    function generationBlocksSend(signals, forceSend) {
+        if (signals.stopButton || signals.replyFlag || signals.recentActivity) return true;
+        if (forceSend && signals.composerEditable) return false;
+        return signals.active || signals.staleSidebar;
+    }
+
     function runContinueNow(forceSend = false) {
-        if (disposed || isSubmitting || awaitingReply || getGenerationSignals().active ||
-            (!forceSend && !enabled)) return;
+        if (disposed || (!forceSend && !enabled)) return;
+        if (forceSend) manualBlockUntil = 0;
+        const signals = getGenerationSignals();
+        const blockReason = isSubmitting ? 'Отправка уже выполняется'
+            : awaitingReply ? 'Ожидание предыдущего ответа'
+            : generationBlocksSend(signals, forceSend) ? 'Генерация ещё активна' : '';
+        if (blockReason) {
+            if (forceSend) showManualBlock(blockReason);
+            return;
+        }
         const failure = getExplicitUiFailure();
         if (failure) {
             pauseForUiFailure(failure.mode, failure.reason);
@@ -1350,7 +1433,7 @@
 
         const chatKeyAtStart = currentChatKey;
         pendingOwnedDraft = { input, text: textToSend, chatKey: chatKeyAtStart };
-        const token = ++pendingSubmitToken;
+        const token= [REDACTED_SECRET];
         isSubmitting = true;
         setStatus('Отправка...', 'send');
         setTabIndicator('working');
@@ -1359,8 +1442,13 @@
         const attemptSend = () => {
             if (disposed || token !== pendingSubmitToken ||
                 getConversationKey() !== chatKeyAtStart ||
-                (!forceSend && !enabled) || getGenerationSignals().active) {
+                (!forceSend && !enabled)) {
                 cancelPendingSend();
+                return;
+            }
+            if (generationBlocksSend(getGenerationSignals(), forceSend)) {
+                cancelPendingSend();
+                if (forceSend) showManualBlock('Генерация возобновилась');
                 return;
             }
             const failure = getExplicitUiFailure();
@@ -1387,7 +1475,7 @@
                 wasGenerating = false;
                 stopNotifiedForCurrentReply = false;
                 recordContinuationSent();
-                playTickSound();
+                try { playTickSound(); } catch (_) {}
                 isSubmitting = false;
                 pendingSubmitTimerId = null;
                 setStatus('Ожидание ответа...', 'idle');
@@ -1537,7 +1625,7 @@
             'color: #ffffff'
         ].join(';');
         sendNowBtnEl.addEventListener('click', () => {
-            ensureAudioContext();
+            try { ensureAudioContext(); } catch (_) {}
             runContinueNow(true);
         });
 
@@ -1873,6 +1961,9 @@
             statusBadgeEl.title = [
                 'Генерация — диагностика',
                 'Sidebar: ' + signals.sidebar,
+                'Sidebar устарел: ' + (signals.staleSidebar ? 'да' : 'нет'),
+                'Sidebar без подтверждения: ' + Math.floor(signals.sidebarOnlyMs / 1000) + 'с',
+                'Недавнее изменение ответа: ' + (signals.recentActivity ? 'да' : 'нет'),
                 'Кнопка Stop: ' + (signals.stopButton ? 'да' : 'нет'),
                 'Атрибут busy: ' + (signals.replyFlag ? 'да' : 'нет'),
                 'Busy устарел: ' + (signals.staleReplyFlag ? 'да' : 'нет'),
@@ -1885,6 +1976,11 @@
         // or ChatGPT might have failed to clear aria-busy after finishing.
         // Never convert this state directly into an automatic continuation.
         // Pause automation and tell the user to verify the conversation.
+        if (signals.staleSidebar && !awaitingReply) {
+            pauseForUiFailure('warning', 'Зависший Sidebar · проверка');
+            updateStatsUI();
+            return;
+        }
         if (signals.staleReplyFlag) {
             pauseForUiFailure('warning', 'Зависший busy · проверка');
             updateStatsUI();
@@ -1909,7 +2005,8 @@
             applyFaviconMode('working');
             setStatus(signals.sidebar === 'working' ? 'Генерация · чат'
                 : signals.stopButton ? 'Генерация · Stop'
-                    : 'Генерация · busy', 'gen');
+                    : signals.recentActivity ? 'Генерация · текст'
+                        : 'Генерация · busy', 'gen');
             performAutoScroll();
             updateStatsUI();
             return;
