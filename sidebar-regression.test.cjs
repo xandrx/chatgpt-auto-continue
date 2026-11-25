@@ -279,3 +279,55 @@ test('delayed execution exception is surfaced and releases submission lock',()=>
 test('production script contains no accidental secret-redaction placeholder',()=>{
     assert.equal(source.includes('['+'REDACTED_SECRET'+']'),false);
 });
+
+function languageFixture(storage = {}) {
+    const writes = [];
+    let refreshes = 0;
+    const ctx = vm.createContext({
+        loadJSON:(key,fallback)=>Object.hasOwn(storage,key)?storage[key]:fallback,
+        saveJSON:(key,value)=>{storage[key]=value;writes.push([key,value]);},
+        STORAGE_DEFAULTS_KEY:'defaults', STORAGE_CHATS_KEY:'chats', DEFAULT_STOP_WORD:'STOP_IT'
+    });
+    const start = source.indexOf("    const STORAGE_LANGUAGE_KEY =");
+    const end = source.indexOf("    let disposed = false;",start);
+    assert.ok(start >= 0 && end > start);
+    vm.runInContext(source.slice(start,end),ctx);
+    ctx.refresh=()=>{refreshes++;};
+    vm.runInContext("refreshLanguageUI = refresh",ctx);
+    vm.runInContext(functionSource('getChatConfig')+'\n'+functionSource('formatDuration')+'\n'+functionSource('stripTabPrefix'),ctx);
+    return {ctx,writes,refreshes:()=>refreshes,language:()=>vm.runInContext('language',ctx)};
+}
+
+test('English is the default locale for new installs',()=>{
+    const f=languageFixture();
+    assert.equal(f.language(),'en');
+    assert.equal(f.ctx.tr('Черновик готов'),'Draft ready');
+    assert.equal(f.ctx.tr('Проверка завершения: 5с'),'Checking completion: 5s');
+    assert.equal(f.ctx.tr('Ошибка отправки: ReferenceError'),'Submission error: ReferenceError');
+    assert.equal(f.ctx.getChatConfig('new').prompt,'Continue');
+    assert.match(f.ctx.getChatConfig('new').stopPrompt,/\{STOP_WORD\}/);
+    assert.equal(f.ctx.formatDuration(65000),'1m 05s');
+});
+
+test('language preference persists without changing saved prompts',()=>{
+    const storage={chats:{chat:{prompt:'продолжай',stopPrompt:'custom rule',stopWord:'CUSTOM'}}};
+    const f=languageFixture(storage);
+    f.ctx.setLanguage('ru');
+    assert.equal(f.ctx.tr('Черновик готов'),'Черновик готов');
+    assert.equal(f.ctx.getChatConfig('new').prompt,'Продолжай');
+    assert.equal(f.ctx.getChatConfig('chat').prompt,'продолжай');
+    assert.equal(f.ctx.getChatConfig('chat').stopWord,'CUSTOM');
+    assert.equal(f.refreshes(),1);
+    assert.equal(languageFixture(storage).language(),'ru');
+    f.ctx.setLanguage('en',false);
+    assert.equal(f.ctx.getChatConfig('chat').stopPrompt,'custom rule');
+    assert.equal(f.writes.length,1);
+    assert.equal(f.refreshes(),2);
+});
+
+test('tab title accepts both language prefixes without duplication',()=>{
+    const f=languageFixture();
+    assert.equal(f.ctx.stripTabPrefix('[DONE] My chat'),'My chat');
+    assert.equal(f.ctx.stripTabPrefix('[ГОТОВО] My chat'),'My chat');
+    assert.equal(f.ctx.stripTabPrefix('[CHECK] My chat'),'My chat');
+});

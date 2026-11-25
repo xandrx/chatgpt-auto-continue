@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         ChatGPT Auto Continue + Floating Panel
 // @namespace    http://tampermonkey.net/
-// @version      1.30
+// @version      1.31
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
-// @description  Автопродолжение с проверкой активности текущего чата в боковой панели, защитой от ложного завершения, звуками и статистикой
+// @description  Auto-continue with conversation activity detection, submission verification, sound alerts and statistics
+// @description:ru Автопродолжение с проверкой активности диалога, подтверждением отправки, звуками и статистикой
 // @match        https://chatgpt.com/*
 // @grant        none
 // @run-at       document-idle
@@ -29,10 +30,7 @@
         sessionStorage.setItem(INSTANCE_KEY, INSTANCE_ID);
     } catch (_) {}
 
-    const DEFAULT_CONTINUE_TEXT = 'Продолжай';
     const DEFAULT_STOP_WORD = 'STOP_IT';
-    const DEFAULT_STOP_PROMPT =
-        'Если дальнейших улучшений нет, напиши {STOP_WORD}. Если не рекомендовано для торговли, также напиши {STOP_WORD}';
     const CHECK_INTERVAL_MS = 800;
     const TAB_READ_DELAY_MS = 3000;
     const TAB_ACTIVITY_WINDOW_MS = 2400;
@@ -60,6 +58,117 @@
     const STORAGE_AUTOSCROLL_KEY = 'cgpt_autocont_autoscroll_v1';
     const STORAGE_COLLAPSED_KEY = 'cgpt_autocont_collapsed_v1';
 
+    const STORAGE_LANGUAGE_KEY = 'cgpt_autocont_language_v1';
+    const UI_EN = Object.freeze({
+        "Продолжай": "Continue",
+        "Если дальнейших улучшений нет, напиши {STOP_WORD}. Если не рекомендовано для торговли, также напиши {STOP_WORD}": "If there are no further improvements, write {STOP_WORD}. If it is not recommended for trading, also write {STOP_WORD}.",
+        "Нет попыток": "No attempts",
+        "Лимит ChatGPT — выкл": "ChatGPT limit — off",
+        "Ошибка ChatGPT — выкл": "ChatGPT error — off",
+        "ГОТОВО": "DONE",
+        "СТОП": "STOP",
+        "ЛИМИТ": "LIMIT",
+        "ПРОВЕРКА": "CHECK",
+        "ОШИБКА": "ERROR",
+        "Развернуть виджет": "Expand widget",
+        "Свернуть виджет в компактный размер": "Collapse widget",
+        "Автоскролл включён (нажмите, чтобы выключить)": "Auto-scroll on (click to disable)",
+        "Автоскролл выключен (нажмите, чтобы включить)": "Auto-scroll off (click to enable)",
+        "Звук включён (нажмите, чтобы выключить)": "Sound on (click to disable)",
+        "Звук выключен (нажмите, чтобы включить)": "Sound off (click to enable)",
+        "откл": "off",
+        "Продолжений": "Continuations",
+        "Стоп": "Stop",
+        "Прошло": "Elapsed",
+        "Среднее": "Average",
+        "Вкл": "On",
+        "Выкл": "Off",
+        "Выключено": "Disabled",
+        "Генерация...": "Generating...",
+        "Ожидание": "Idle",
+        "Клик: ": "Click: ",
+        "Стоп-слово": "Stop word",
+        "Отправка уже выполняется": "Submission already in progress",
+        "Ожидание предыдущего ответа": "Waiting for previous reply",
+        "Генерация ещё активна": "Generation still active",
+        "Поле ввода не найдено": "Composer not found",
+        "Черновик не пуст — отправка отменена": "Draft not empty — submission canceled",
+        "Повтор: готовый черновик": "Retry: draft ready",
+        "Заполнение редактора": "Filling composer",
+        "Не удалось заполнить поле ввода": "Could not fill composer",
+        "Черновик готов": "Draft ready",
+        "Отправка...": "Sending...",
+        "Генерация возобновилась": "Generation resumed",
+        "Черновик изменён — отправка отменена": "Draft changed — submission canceled",
+        "Отправка подтверждена": "Submission confirmed",
+        "Ожидание ответа...": "Waiting for reply...",
+        "Клик без подтверждения": "Click not confirmed",
+        "Отправка не подтверждена — проверьте черновик": "Submission not confirmed — check draft",
+        "Кнопка отправки недоступна": "Send button unavailable",
+        "Ошибка отправки: ": "Submission error: ",
+        "Перетащить панель": "Drag widget",
+        "Число продолжений в текущем чате": "Continuations in this conversation",
+        "Отправить промпт сейчас": "Send prompt now",
+        "Промпт для продолжения...": "Continuation prompt...",
+        "Базовый промпт (поддерживает несколько строк; к нему добавится стоп-промпт)": "Base prompt (multiline; the stop prompt is appended)",
+        "Сбросить промпт, стоп-промпт и стоп-слово": "Reset prompt, stop prompt and stop word",
+        "Стоп-промпт (поддерживает {STOP_WORD}):": "Stop prompt (supports {STOP_WORD}):",
+        "Правило остановки...": "Stop condition...",
+        "Инструкция об условиях вывода стоп-слова (сохраняется для каждого чата)": "Instructions for when to output the stop word (saved per conversation)",
+        "Стоп-слово:": "Stop word:",
+        "Если агент выведет это слово, сработает звуковой сигнал и автопродолжение выключится": "If the agent outputs this word, a sound plays and auto-continue is disabled",
+        "Генерация — диагностика": "Generation — diagnostics",
+        "Отправка: ": "Submission: ",
+        "Sidebar устарел: ": "Sidebar stale: ",
+        "Sidebar без подтверждения: ": "Unconfirmed sidebar: ",
+        "Недавнее изменение ответа: ": "Recent response activity: ",
+        "Запрос без ответа: ": "Unanswered request: ",
+        "Кнопка Stop: ": "Stop button: ",
+        "Атрибут busy: ": "Busy attribute: ",
+        "Busy устарел: ": "Busy stale: ",
+        "Отправка доступна: ": "Send available: ",
+        "Редактор доступен: ": "Composer editable: ",
+        "да": "yes",
+        "нет": "no",
+        "Зависший Sidebar · проверка": "Stale sidebar · check",
+        "Зависший busy · проверка": "Stale busy · check",
+        "Генерация · чат": "Generating · chat",
+        "Генерация · Stop": "Generating · Stop",
+        "Генерация · текст": "Generating · text",
+        "Генерация · запрос": "Generating · request",
+        "Генерация · busy": "Generating · busy",
+        "Нет ответа — выкл": "No reply — off",
+        "Язык интерфейса": "Interface language"
+    });
+    let language = loadJSON(STORAGE_LANGUAGE_KEY, 'en') === 'ru' ? 'ru' : 'en';
+    let refreshLanguageUI = null;
+
+    function tr(text) {
+        if (language === 'ru' || typeof text !== 'string') return text;
+        if (Object.prototype.hasOwnProperty.call(UI_EN, text)) return UI_EN[text];
+        for (const prefix of ['Клик: ', 'Ошибка отправки: ']) {
+            if (text.startsWith(prefix)) return UI_EN[prefix] + text.slice(prefix.length);
+        }
+        const completion = text.match(/^Проверка завершения: (\d+)с$/u);
+        return completion ? 'Checking completion: ' + completion[1] + 's' : text;
+    }
+
+    function setLanguage(next, persist = true) {
+        const normalized = next === 'ru' ? 'ru' : 'en';
+        if (language === normalized) return;
+        language = normalized;
+        if (persist) saveJSON(STORAGE_LANGUAGE_KEY, language);
+        refreshLanguageUI?.();
+    }
+
+    function defaultContinueText() {
+        return tr('Продолжай');
+    }
+
+    function defaultStopPrompt() {
+        return tr('Если дальнейших улучшений нет, напиши {STOP_WORD}. Если не рекомендовано для торговли, также напиши {STOP_WORD}');
+    }
+
     let disposed = false;
     let currentChatKey = null;
     // A newly opened tab must not inherit an old global enabled flag.
@@ -67,9 +176,9 @@
     let soundEnabled = loadBoolPref(STORAGE_SOUND_KEY, true);
     let autoScrollEnabled = loadBoolPref(STORAGE_AUTOSCROLL_KEY, true);
     let collapsed = loadBoolPref(STORAGE_COLLAPSED_KEY, false);
-    let continueText = DEFAULT_CONTINUE_TEXT;
+    let continueText = defaultContinueText();
     let stopWord = DEFAULT_STOP_WORD;
-    let stopPrompt = DEFAULT_STOP_PROMPT;
+    let stopPrompt = defaultStopPrompt();
     let wasGenerating = false;
     let hasCompletedOnce = false;
     let stopNotifiedForCurrentReply = false;
@@ -130,7 +239,7 @@
 
     function stripTabPrefix(title) {
         return String(title || '')
-            .replace(/^(?:(?:🟠|🟢|\?\?)\s*)?\[(?:РАБОТАЕТ|ГОТОВО|СТОП|ЛИМИТ|ПРОВЕРКА|ОШИБКА|\d{2,}:\d{2}(?::\d{2})?)\]\s*/u, '')
+            .replace(/^(?:(?:🟠|🟢|\?\?)\s*)?\[(?:РАБОТАЕТ|ГОТОВО|СТОП|ЛИМИТ|ПРОВЕРКА|ОШИБКА|WORKING|DONE|STOP|LIMIT|CHECK|ERROR|\d{2,}:\d{2}(?::\d{2})?)\]\s*/u, '')
             .replace(/^(?:🟠|🟢)\s*/u, '')
             .trim();
     }
@@ -390,10 +499,10 @@
         if (mode === 'working') {
             nextTitle = `[${formatTabElapsed(Date.now() - (tabRequestStartedAtMs ?? Date.now()))}] ${targetBase}`;
         } else if (mode === 'done') {
-            nextTitle = `[ГОТОВО] ${targetBase}`;
+            nextTitle = `[${tr('ГОТОВО')}] ${targetBase}`;
         } else if (['stopped', 'limit', 'warning', 'error'].includes(mode)) {
             const labels = {stopped:'СТОП', limit:'ЛИМИТ', warning:'ПРОВЕРКА', error:'ОШИБКА'};
-            nextTitle = `[${labels[mode]}] ${targetBase}`;
+            nextTitle = `[${tr(labels[mode])}] ${targetBase}`;
         }
 
         if (document.title !== nextTitle) {
@@ -512,7 +621,7 @@
         panelEl.style.gap = collapsed ? '0px' : '8px';
 
         collapseBtnEl.textContent = collapsed ? '▣' : '−';
-        collapseBtnEl.title = collapsed ? 'Развернуть виджет' : 'Свернуть виджет в компактный размер';
+        collapseBtnEl.title = tr(collapsed ? 'Развернуть виджет' : 'Свернуть виджет в компактный размер');
 
         requestAnimationFrame(() => {
             clampPanelToViewport(false);
@@ -690,12 +799,12 @@
         const seconds = totalSec % 60;
 
         if (hours > 0) {
-            return `${hours}ч ${String(minutes).padStart(2, '0')}м ${String(seconds).padStart(2, '0')}с`;
+            return `${hours}${language === 'ru' ? 'ч' : 'h'} ${String(minutes).padStart(2, '0')}${language === 'ru' ? 'м' : 'm'} ${String(seconds).padStart(2, '0')}${language === 'ru' ? 'с' : 's'}`;
         }
         if (minutes > 0) {
-            return `${minutes}м ${String(seconds).padStart(2, '0')}с`;
+            return `${minutes}${language === 'ru' ? 'м' : 'm'} ${String(seconds).padStart(2, '0')}${language === 'ru' ? 'с' : 's'}`;
         }
-        return `${seconds}с`;
+        return `${seconds}${language === 'ru' ? 'с' : 's'}`;
     }
 
     function resetSessionStats(keepEnabledStart) {
@@ -738,8 +847,8 @@
 
     function getChatConfig(chatKey) {
         const defaults = loadJSON(STORAGE_DEFAULTS_KEY, {
-            prompt: DEFAULT_CONTINUE_TEXT,
-            stopPrompt: DEFAULT_STOP_PROMPT,
+            prompt: defaultContinueText(),
+            stopPrompt: defaultStopPrompt(),
             stopWord: DEFAULT_STOP_WORD
         });
         const chats = loadJSON(STORAGE_CHATS_KEY, {});
@@ -753,13 +862,13 @@
                     ? saved.prompt
                     : (typeof defaults.prompt === 'string' && defaults.prompt.trim().length > 0
                         ? defaults.prompt
-                        : DEFAULT_CONTINUE_TEXT),
+                        : defaultContinueText()),
             stopPrompt:
                 typeof saved.stopPrompt === 'string'
                     ? saved.stopPrompt
                     : (typeof defaults.stopPrompt === 'string'
                         ? defaults.stopPrompt
-                        : DEFAULT_STOP_PROMPT),
+                        : defaultStopPrompt()),
             stopWord:
                 typeof saved.stopWord === 'string'
                     ? saved.stopWord.trim()
@@ -772,7 +881,7 @@
     function saveChatConfig(chatKey, nextPrompt, nextStopPrompt, nextStopWord) {
         if (!chatKey) return;
         const cleanPrompt = typeof nextPrompt === 'string' && nextPrompt.trim()
-            ? nextPrompt : DEFAULT_CONTINUE_TEXT;
+            ? nextPrompt : defaultContinueText();
         const cleanStopPrompt = typeof nextStopPrompt === 'string' ? nextStopPrompt : '';
         const cleanStopWord = typeof nextStopWord === 'string' ? nextStopWord.trim() : '';
 
@@ -1122,7 +1231,8 @@
             text = manualBlockReason;
             state = 'stop';
         }
-        statusBadgeEl.textContent = text;
+        statusBadgeEl.dataset.rawStatus = text;
+        statusBadgeEl.textContent = tr(text);
         statusBadgeEl.dataset.state = state;
         updateStatusTooltip();
 
@@ -1141,9 +1251,9 @@
     function updateScrollUI() {
         if (!scrollBtnEl) return;
         scrollBtnEl.textContent = autoScrollEnabled ? '⇩' : '↧';
-        scrollBtnEl.title = autoScrollEnabled
+        scrollBtnEl.title = tr(autoScrollEnabled
             ? 'Автоскролл включён (нажмите, чтобы выключить)'
-            : 'Автоскролл выключен (нажмите, чтобы включить)';
+            : 'Автоскролл выключен (нажмите, чтобы включить)');
         scrollBtnEl.style.opacity = autoScrollEnabled ? '1' : '0.55';
         scrollBtnEl.style.borderColor = autoScrollEnabled
             ? 'rgba(59, 130, 246, 0.5)'
@@ -1153,9 +1263,9 @@
     function updateSoundUI() {
         if (!soundBtnEl) return;
         soundBtnEl.textContent = soundEnabled ? '🔊' : '🔇';
-        soundBtnEl.title = soundEnabled
+        soundBtnEl.title = tr(soundEnabled
             ? 'Звук включён (нажмите, чтобы выключить)'
-            : 'Звук выключен (нажмите, чтобы включить)';
+            : 'Звук выключен (нажмите, чтобы включить)');
         soundBtnEl.style.opacity = soundEnabled ? '1' : '0.6';
     }
 
@@ -1166,25 +1276,25 @@
         if (!statsEl) return;
 
         const now = Date.now();
-        const elapsedStr = enabled && enabledSinceMs ? formatDuration(now - enabledSinceMs) : '0с';
+        const elapsedStr = enabled && enabledSinceMs ? formatDuration(now - enabledSinceMs) : formatDuration(0);
         const avgMs =
             cycleDurationsMs.length > 0
                 ? cycleDurationsMs.reduce((acc, v) => acc + v, 0) / cycleDurationsMs.length
                 : null;
         const avgStr = avgMs !== null ? formatDuration(avgMs) : '-';
-        const stopWordDisplay = stopWord ? stopWord : 'откл';
+        const stopWordDisplay = stopWord ? stopWord : tr('откл');
 
         // The marker is user-editable; inserting it into innerHTML is unsafe.
         const row1 = document.createElement('div');
-        row1.textContent = `Продолжений: ${sessionCount} · Стоп: ${stopWordDisplay}`;
+        row1.textContent = `${tr('Продолжений')}: ${sessionCount} · ${tr('Стоп')}: ${stopWordDisplay}`;
         const row2 = document.createElement('div');
-        row2.textContent = `Прошло: ${elapsedStr} · Среднее: ${avgStr}`;
+        row2.textContent = `${tr('Прошло')}: ${elapsedStr} · ${tr('Среднее')}: ${avgStr}`;
         statsEl.replaceChildren(row1, row2);
     }
 
     function updateToggleUI() {
         if (!toggleBtnEl) return;
-        toggleBtnEl.textContent = enabled ? 'Вкл' : 'Выкл';
+        toggleBtnEl.textContent = tr(enabled ? 'Вкл' : 'Выкл');
         toggleBtnEl.style.background = enabled ? '#16a34a' : '#334155';
         toggleBtnEl.style.color = '#ffffff';
         toggleBtnEl.setAttribute('aria-pressed', String(enabled));
@@ -1310,7 +1420,7 @@
 
     function getActivePromptText() {
         const raw = promptInputEl ? promptInputEl.value : continueText;
-        return typeof raw === 'string' && raw.trim().length > 0 ? raw : DEFAULT_CONTINUE_TEXT;
+        return typeof raw === 'string' && raw.trim().length > 0 ? raw : defaultContinueText();
     }
 
     function getActiveStopPromptText() {
@@ -1610,11 +1720,16 @@
             'user-select: none'
         ].join(';');
 
+        const staticLabels = [];
+        const label = (element, property, text) => {
+            staticLabels.push({element, property, text});
+            element[property] = tr(text);
+        };
         const topRow = document.createElement('div');
         topRow.style.cssText = 'display: flex; align-items: center; gap: 4px; min-width: 0; max-width: 100%; flex-shrink: 0;';
 
         const dragHandle = document.createElement('span');
-        dragHandle.title = 'Перетащить панель';
+        label(dragHandle, 'title', 'Перетащить панель');
         dragHandle.textContent = '⠿';
         dragHandle.style.cssText = 'cursor: grab; color: #94a3b8; font-size: 13px; padding: 0 2px;';
 
@@ -1632,7 +1747,7 @@
         ].join(';');
 
         compactCountEl = document.createElement('span');
-        compactCountEl.title = 'Число продолжений в текущем чате';
+        label(compactCountEl, 'title', 'Число продолжений в текущем чате');
         compactCountEl.style.cssText = [
             'font-size: 11px',
             'font-weight: 600',
@@ -1703,7 +1818,7 @@
 
         sendNowBtnEl = document.createElement('button');
         sendNowBtnEl.type = 'button';
-        sendNowBtnEl.title = 'Отправить промпт сейчас';
+        label(sendNowBtnEl, 'title', 'Отправить промпт сейчас');
         sendNowBtnEl.textContent = '▶';
         sendNowBtnEl.style.cssText = [
             'border: none',
@@ -1756,9 +1871,9 @@
 
         promptInputEl = document.createElement('textarea');
         promptInputEl.rows = 3;
-        promptInputEl.placeholder = 'Промпт для продолжения...';
+        label(promptInputEl, 'placeholder', 'Промпт для продолжения...');
 
-        promptInputEl.title = 'Базовый промпт (поддерживает несколько строк; к нему добавится стоп-промпт)';
+        label(promptInputEl, 'title', 'Базовый промпт (поддерживает несколько строк; к нему добавится стоп-промпт)');
         promptInputEl.value = continueText;
         promptInputEl.style.cssText = [
             'flex: 1',
@@ -1791,7 +1906,7 @@
 
         const resetPromptBtn = document.createElement('button');
         resetPromptBtn.type = 'button';
-        resetPromptBtn.title = 'Сбросить промпт, стоп-промпт и стоп-слово';
+        label(resetPromptBtn, 'title', 'Сбросить промпт, стоп-промпт и стоп-слово');
         resetPromptBtn.textContent = '↺';
         resetPromptBtn.style.cssText = [
             'border: 1px solid rgba(148, 163, 184, 0.25)',
@@ -1803,8 +1918,8 @@
             'color: #cbd5e1'
         ].join(';');
         resetPromptBtn.addEventListener('click', () => {
-            continueText = DEFAULT_CONTINUE_TEXT;
-            stopPrompt = DEFAULT_STOP_PROMPT;
+            continueText = defaultContinueText();
+            stopPrompt = defaultStopPrompt();
             stopWord = DEFAULT_STOP_WORD;
             promptInputEl.value = continueText;
             if (stopPromptInputEl) stopPromptInputEl.value = stopPrompt;
@@ -1817,13 +1932,13 @@
         stopPromptBox.style.cssText = 'display: flex; flex-direction: column; gap: 4px;';
 
         const stopPromptLabel = document.createElement('span');
-        stopPromptLabel.textContent = 'Стоп-промпт (поддерживает {STOP_WORD}):';
+        label(stopPromptLabel, 'textContent', 'Стоп-промпт (поддерживает {STOP_WORD}):');
         stopPromptLabel.style.cssText = 'font-size: 10px; color: #94a3b8;';
 
         stopPromptInputEl = document.createElement('textarea');
         stopPromptInputEl.rows = 2;
-        stopPromptInputEl.placeholder = 'Правило остановки...';
-        stopPromptInputEl.title = 'Инструкция об условиях вывода стоп-слова (сохраняется для каждого чата)';
+        label(stopPromptInputEl, 'placeholder', 'Правило остановки...');
+        label(stopPromptInputEl, 'title', 'Инструкция об условиях вывода стоп-слова (сохраняется для каждого чата)');
         stopPromptInputEl.value = stopPrompt;
         stopPromptInputEl.style.cssText = [
             'width: 100%',
@@ -1856,13 +1971,13 @@
         stopRow.style.cssText = 'display: flex; align-items: center; gap: 6px; font-size: 11px; color: #94a3b8;';
 
         const stopLabel = document.createElement('span');
-        stopLabel.textContent = 'Стоп-слово:';
+        label(stopLabel, 'textContent', 'Стоп-слово:');
         stopLabel.style.cssText = 'white-space: nowrap;';
 
         stopWordInputEl = document.createElement('input');
         stopWordInputEl.type = 'text';
         stopWordInputEl.placeholder = 'STOP_IT';
-        stopWordInputEl.title = 'Если агент выведет это слово, сработает звуковой сигнал и автопродолжение выключится';
+        label(stopWordInputEl, 'title', 'Если агент выведет это слово, сработает звуковой сигнал и автопродолжение выключится');
         stopWordInputEl.value = stopWord;
         stopWordInputEl.style.cssText = [
             'flex: 1',
@@ -1962,7 +2077,40 @@
         bodyContainerEl.appendChild(promptRow);
         bodyContainerEl.appendChild(stopPromptBox);
         bodyContainerEl.appendChild(stopRow);
+        const languageRow = document.createElement('div');
+        languageRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:11px;color:#94a3b8;';
+        const languageLabel = document.createElement('span');
+        label(languageLabel, 'textContent', 'Язык интерфейса');
+        const languageSelect = document.createElement('select');
+        languageSelect.style.cssText = 'max-width:110px;color:#e2e8f0;background:#1e293b;border:1px solid #475569;border-radius:6px;padding:3px 5px;font:inherit;cursor:pointer;';
+        label(languageSelect, 'title', 'Язык интерфейса');
+        for (const [value, name] of [['en', 'English'], ['ru', 'Русский']]) {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = name;
+            languageSelect.appendChild(option);
+        }
+        languageSelect.value = language;
+        languageSelect.addEventListener('change', () => setLanguage(languageSelect.value));
+        languageSelect.addEventListener('keydown', e => e.stopPropagation());
+        languageRow.append(languageLabel, languageSelect);
+        bodyContainerEl.appendChild(languageRow);
         bodyContainerEl.appendChild(statsEl);
+
+        refreshLanguageUI = () => {
+            for (const entry of staticLabels) entry.element[entry.property] = tr(entry.text);
+            languageSelect.value = language;
+            updateScrollUI();
+            updateSoundUI();
+            updateCollapsedUI();
+            toggleBtnEl.textContent = tr(enabled ? 'Вкл' : 'Выкл');
+            if (statusBadgeEl.dataset.rawStatus) {
+                setStatus(statusBadgeEl.dataset.rawStatus, statusBadgeEl.dataset.state);
+            }
+            updateStatusTooltip();
+            updateStatsUI();
+            applyTitleMode(tabIndicatorMode);
+        };
 
         panelEl.appendChild(topRow);
         panelEl.appendChild(bodyContainerEl);
@@ -2045,7 +2193,7 @@
 
         if (isSubmitting) {
             setStatus('Отправка...', 'send');
-            updateStatusTooltip('Отправка: ' + lastSendStage);
+            updateStatusTooltip(tr('Отправка: ') + tr(lastSendStage));
             setTabIndicator('working');
             updateStatsUI();
             return;
@@ -2055,18 +2203,18 @@
         const now = Date.now();
         if (statusBadgeEl) {
             updateStatusTooltip([
-                'Генерация — диагностика',
-                'Отправка: ' + lastSendStage,
+                tr('Генерация — диагностика'),
+                tr('Отправка: ') + tr(lastSendStage),
                 'Sidebar: ' + signals.sidebar,
-                'Sidebar устарел: ' + (signals.staleSidebar ? 'да' : 'нет'),
-                'Sidebar без подтверждения: ' + Math.floor(signals.sidebarOnlyMs / 1000) + 'с',
-                'Недавнее изменение ответа: ' + (signals.recentActivity ? 'да' : 'нет'),
-                'Запрос без ответа: ' + (signals.unansweredUserTurn ? 'да' : 'нет'),
-                'Кнопка Stop: ' + (signals.stopButton ? 'да' : 'нет'),
-                'Атрибут busy: ' + (signals.replyFlag ? 'да' : 'нет'),
-                'Busy устарел: ' + (signals.staleReplyFlag ? 'да' : 'нет'),
-                'Отправка доступна: ' + (signals.sendReady ? 'да' : 'нет'),
-                'Редактор доступен: ' + (signals.composerEditable ? 'да' : 'нет')
+                tr('Sidebar устарел: ') + (signals.staleSidebar ? tr('да') : tr('нет')),
+                tr('Sidebar без подтверждения: ') + formatDuration(signals.sidebarOnlyMs),
+                tr('Недавнее изменение ответа: ') + (signals.recentActivity ? tr('да') : tr('нет')),
+                tr('Запрос без ответа: ') + (signals.unansweredUserTurn ? tr('да') : tr('нет')),
+                tr('Кнопка Stop: ') + (signals.stopButton ? tr('да') : tr('нет')),
+                tr('Атрибут busy: ') + (signals.replyFlag ? tr('да') : tr('нет')),
+                tr('Busy устарел: ') + (signals.staleReplyFlag ? tr('да') : tr('нет')),
+                tr('Отправка доступна: ') + (signals.sendReady ? tr('да') : tr('нет')),
+                tr('Редактор доступен: ') + (signals.composerEditable ? tr('да') : tr('нет'))
             ].join('\n'));
         }
 
@@ -2211,7 +2359,12 @@
     }
 
     const onStorage = (e) => {
-        if (disposed || (e.key !== STORAGE_CHATS_KEY && e.key !== STORAGE_DEFAULTS_KEY)) return;
+        if (disposed) return;
+        if (e.key === STORAGE_LANGUAGE_KEY) {
+            setLanguage(loadJSON(STORAGE_LANGUAGE_KEY, 'en'), false);
+            return;
+        }
+        if (e.key !== STORAGE_CHATS_KEY && e.key !== STORAGE_DEFAULTS_KEY) return;
         // A second tab editing a prompt may refresh the text preferences, but
         // MUST NOT reset this tab's enabled flag, pending send or cycle state.
         if (getConversationKey() !== currentChatKey) return;

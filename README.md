@@ -4,8 +4,8 @@
 
 A **Tampermonkey userscript** that automatically continues a [ChatGPT](https://chatgpt.com/) conversation once the assistant has finished responding. It provides a compact floating control panel, configurable stop word, session statistics, and safeguards against sending a follow-up while a response is still being generated.
 
-**Current version:** 1.26  
-**Interface language:** Russian  
+**Current version:** 1.31  
+**Interface language:** English (default) / Russian  
 **Supported website:** `https://chatgpt.com/*`
 
 > This is an unofficial project and is not affiliated with OpenAI. Automatically sending messages may consume your ChatGPT usage limits and continue an interaction without manual approval. Monitor its activity and avoid using it for unsupervised sensitive actions.
@@ -19,7 +19,7 @@ A **Tampermonkey userscript** that automatically continues a [ChatGPT](https://c
 
 ## Features
 
-- **Automatic continuation:** Sends your configured message after the assistant's response is confirmed complete. The default prompt is `Продолжай` (“Continue”).
+- **Automatic continuation:** Sends your configured message after the assistant's response is confirmed complete. The default prompt is `Continue` in English and `Продолжай` in Russian.
 - **False-completion protection (v1.19):** Detects active generation using the Stop button, assistant response attributes, and the **current conversation's** sidebar indicator (`data-sidebar-indicator="working"`).
 - **Stable completion check:** Waits **5 seconds** after all generation indicators disappear, or **10 seconds** if the conversation row is unavailable in the sidebar. If generation resumes, the timer resets.
 - **Duplicate-send prevention:** Rechecks generation immediately before sending. If generation resumes, it cancels the prepared draft as long as the user has not edited it.
@@ -34,6 +34,8 @@ A **Tampermonkey userscript** that automatically continues a [ChatGPT](https://c
 - **Shared prompt preferences:** Prompt text, stop instructions, and stop words remain stored per conversation in `localStorage`; changes to these preferences no longer reset another tab's generation or pending submission.
 
 ## How to use
+
+Select English or Russian in the **Interface language** field. The preference is shared across tabs; switching does not overwrite saved prompts or interrupt the current cycle. The reset button restores defaults in the selected language.
 
 1. In the panel, keep or customize the **continuation prompt**.
 2. Optionally configure the **stop instruction** and **stop word**.
