@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Auto Continue + Floating Panel
 // @namespace    http://tampermonkey.net/
-// @version      1.24
+// @version      1.25
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @description  Автопродолжение с проверкой активности текущего чата в боковой панели, защитой от ложного завершения, звуками и статистикой
@@ -34,6 +34,8 @@
     const DEFAULT_STOP_PROMPT =
         'Если дальнейших улучшений нет, напиши {STOP_WORD}. Если не рекомендовано для торговли, также напиши {STOP_WORD}';
     const CHECK_INTERVAL_MS = 800;
+    const TAB_READ_DELAY_MS = 3000;
+    const TAB_ACTIVITY_WINDOW_MS = 2400;
     const SUBMIT_DELAY_MS = 450;
     // Do not treat a quiet response as finished: thinking/tool calls can take minutes.
     const SEND_READY_TIMEOUT_MS = 3000;
@@ -89,6 +91,12 @@
     let generatedFaviconLink = null;
     let titleObserver = null;
     let isUpdatingTitle = false;
+    let tabRequestStartedAtMs = null;
+    let tabLastActivityAtMs = null;
+    let tabLastAssistantSnapshot = null;
+    let tabReadFocusSinceMs = null;
+    let lastFaviconKey = null;
+    const badgeFaviconCache = new Map();
 
     let sessionCount = 0;
     let enabledSinceMs = null;
@@ -112,9 +120,54 @@
 
     function stripTabPrefix(title) {
         return String(title || '')
-            .replace(/^(?:🟠|🟢|\?\?)\s*\[(?:РАБОТАЕТ|ГОТОВО)\]\s*/u, '')
+            .replace(/^(?:(?:🟠|🟢|\?\?)\s*)?\[(?:РАБОТАЕТ|ГОТОВО|\d{2,}:\d{2}(?::\d{2})?)\]\s*/u, '')
             .replace(/^(?:🟠|🟢)\s*/u, '')
             .trim();
+    }
+
+    function formatTabElapsed(ms) {
+        const seconds = Math.floor(Math.max(0, ms) / 1000);
+        const hours = Math.floor(seconds / 3600);
+        const mm = String(Math.floor((seconds % 3600) / 60)).padStart(2, '0');
+        const ss = String(seconds % 60).padStart(2, '0');
+        return hours ? String(hours).padStart(2, '0') + ':' + mm + ':' + ss : mm + ':' + ss;
+    }
+
+    function sampleTabAssistantActivity(active, now = Date.now()) {
+        const turns = getAssistantElements();
+        const last = turns[turns.length - 1];
+        const next = {
+            count: turns.length,
+            id: last?.getAttribute('data-message-id') ||
+                last?.getAttribute('data-dil-message-id') || '',
+            text: last?.textContent || ''
+        };
+        const previous = tabLastAssistantSnapshot;
+        // Keep an idle baseline; spinner animations alone never count as output.
+        if (active && previous &&
+            (next.count > previous.count ||
+             (next.id && next.id !== previous.id) ||
+             next.text !== previous.text) && next.text.trim()) {
+            tabLastActivityAtMs = now;
+        }
+        tabLastAssistantSnapshot = next;
+    }
+
+    function resetTabReadFocus() {
+        tabReadFocusSinceMs = null;
+    }
+
+    function acknowledgeTabCompletion(now = Date.now()) {
+        if (tabIndicatorMode !== 'done' ||
+            document.visibilityState !== 'visible' || !document.hasFocus()) {
+            resetTabReadFocus();
+            return false;
+        }
+        if (tabReadFocusSinceMs === null) tabReadFocusSinceMs = now;
+        if (now - tabReadFocusSinceMs < TAB_READ_DELAY_MS) return false;
+        hasCompletedOnce = false; // Don't recreate the badge on the next tick.
+        setTabIndicator(null);
+        return true;
     }
 
     function captureOriginalFavicons() {
@@ -140,7 +193,7 @@
         }
     }
 
-    function buildBadgeFaviconDataUrl(mode) {
+    function buildBadgeFaviconDataUrl(mode, phase = -1) {
         try {
             const canvas = document.createElement('canvas');
             canvas.width = 64;
@@ -164,9 +217,10 @@
             ctx.fillStyle = '#ffffff';
             if (isWorking) {
                 const dots = [20, 32, 44];
-                for (const cx of dots) {
+                for (let i = 0; i < dots.length; i++) {
                     ctx.beginPath();
-                    ctx.arc(cx, 32, 4.5, 0, Math.PI * 2);
+                    ctx.fillStyle = phase < 0 || i === phase ? '#ffffff' : '#fdba74';
+                    ctx.arc(dots[i], 32, phase === i ? 6.2 : 4.5, 0, Math.PI * 2);
                     ctx.fill();
                 }
             } else {
@@ -189,16 +243,27 @@
 
     function applyFaviconMode(mode) {
         if (!mode) {
-            restoreOriginalFavicons();
+            if (lastFaviconKey !== null) restoreOriginalFavicons();
+            lastFaviconKey = null;
             return;
         }
 
-        if (originalFaviconHrefs.length === 0) {
-            captureOriginalFavicons();
-        }
+        const now = Date.now();
+        const recent = mode === 'working' && tabLastActivityAtMs !== null &&
+            now - tabLastActivityAtMs < TAB_ACTIVITY_WINDOW_MS;
+        const phase = recent ? Math.floor(now / CHECK_INTERVAL_MS) % 3 : -1;
+        const key = mode + ':' + phase;
+        if (lastFaviconKey === key && generatedFaviconLink?.isConnected) return;
 
-        const dataUrl = buildBadgeFaviconDataUrl(mode);
-        if (!dataUrl) return;
+        if (originalFaviconHrefs.length === 0) captureOriginalFavicons();
+
+        let dataUrl = badgeFaviconCache.get(key);
+        if (!dataUrl) {
+            dataUrl = buildBadgeFaviconDataUrl(mode, phase);
+            if (!dataUrl) return;
+            badgeFaviconCache.set(key, dataUrl);
+        }
+        lastFaviconKey = key;
 
         for (const item of originalFaviconHrefs) {
             if (item.el && item.el.isConnected) {
@@ -228,9 +293,9 @@
         let nextTitle = targetBase;
 
         if (mode === 'working') {
-            nextTitle = `🟠 [РАБОТАЕТ] ${targetBase}`;
+            nextTitle = `[${formatTabElapsed(Date.now() - (tabRequestStartedAtMs ?? Date.now()))}] ${targetBase}`;
         } else if (mode === 'done') {
-            nextTitle = `🟢 [ГОТОВО] ${targetBase}`;
+            nextTitle = `[ГОТОВО] ${targetBase}`;
         }
 
         if (document.title !== nextTitle) {
@@ -245,13 +310,12 @@
     function setTabIndicator(mode) {
         if (disposed) return;
         const normalizedMode = mode === 'working' || mode === 'done' ? mode : null;
-        if (tabIndicatorMode === normalizedMode) {
-            if (normalizedMode) {
-                applyTitleMode(normalizedMode);
-            }
-            return;
+        if (tabIndicatorMode !== normalizedMode) {
+            tabRequestStartedAtMs = normalizedMode === 'working' ? Date.now() : null;
+            tabLastActivityAtMs = null;
+            resetTabReadFocus();
+            tabIndicatorMode = normalizedMode;
         }
-        tabIndicatorMode = normalizedMode;
         applyTitleMode(normalizedMode);
         applyFaviconMode(normalizedMode);
     }
@@ -262,10 +326,7 @@
 
         titleObserver = new MutationObserver(() => {
             if (disposed || isUpdatingTitle || !tabIndicatorMode) return;
-            const expectedPrefix = tabIndicatorMode === 'working' ? '🟠 [РАБОТАЕТ]' : '🟢 [ГОТОВО]';
-            if (!document.title.startsWith(expectedPrefix)) {
-                applyTitleMode(tabIndicatorMode);
-            }
+            applyTitleMode(tabIndicatorMode);
         });
 
         titleObserver.observe(titleEl, {
@@ -659,6 +720,10 @@
         submittedAssistantCount = 0;
         userScrolledAway = false;
         basePageTitle = stripTabPrefix(document.title) || null;
+        tabLastAssistantSnapshot = null;
+        tabLastActivityAtMs = null;
+        tabRequestStartedAtMs = null;
+        resetTabReadFocus();
         setTabIndicator(null);
 
         if (tabState.stats) {
@@ -1216,6 +1281,7 @@
                 hasCompletedOnce = false;
                 submittedAssistantCount = assistantCount;
                 submittedAtMs = Date.now();
+                tabRequestStartedAtMs = submittedAtMs;
                 awaitingReply = true;
                 wasGenerating = false;
                 stopNotifiedForCurrentReply = false;
@@ -1747,6 +1813,8 @@
             }
             wasGenerating = true;
             setTabIndicator('working');
+            sampleTabAssistantActivity(true, now);
+            applyFaviconMode('working');
             setStatus(signals.sidebar === 'working' ? 'Генерация · чат'
                 : signals.stopButton ? 'Генерация · Stop'
                     : 'Генерация · busy', 'gen');
@@ -1754,6 +1822,8 @@
             updateStatsUI();
             return;
         }
+
+        sampleTabAssistantActivity(false, now);
 
         if (awaitingReply) {
             // Do NOT send another prompt after an unconfirmed submission.
@@ -1805,7 +1875,11 @@
             }
         } else if (hasCompletedOnce) {
             setTabIndicator('done');
+        } else if (tabIndicatorMode === 'working') {
+            setTabIndicator(null); // Canceled or failed submission.
         }
+
+        acknowledgeTabCompletion(now);
 
         if (!enabled) {
             if (statusBadgeEl?.dataset.state !== 'stop') {
@@ -1840,6 +1914,9 @@
         updateStatsUI();
     };
     window.addEventListener('storage', onStorage);
+    window.addEventListener('blur', resetTabReadFocus);
+    window.addEventListener('focus', resetTabReadFocus);
+    document.addEventListener('visibilitychange', resetTabReadFocus);
     window.addEventListener('wheel', onWheelOrTouch, { passive: true });
     window.addEventListener('touchstart', onWheelOrTouch, { passive: true });
     window.addEventListener('scroll', onScrollEvent, { passive: true, capture: true });
@@ -1872,6 +1949,9 @@
             titleObserver = null;
         }
         window.removeEventListener('storage', onStorage);
+        window.removeEventListener('blur', resetTabReadFocus);
+        window.removeEventListener('focus', resetTabReadFocus);
+        document.removeEventListener('visibilitychange', resetTabReadFocus);
         window.removeEventListener('wheel', onWheelOrTouch);
         window.removeEventListener('touchstart', onWheelOrTouch);
         window.removeEventListener('scroll', onScrollEvent, { capture: true });
