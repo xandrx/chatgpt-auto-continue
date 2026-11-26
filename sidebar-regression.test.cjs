@@ -128,12 +128,103 @@ test('finds enabled real send button even when preferred selector is disabled', 
     assert.equal(ctx.getSendButton(),disabled); // never choose the enabled voice control
 });
 
-test('composer lookup skips a hidden duplicate left by hydration',()=>{
-    const hidden={closest:()=>null,getAttribute:()=>null};
-    const active={closest:()=>null,getAttribute:()=>null};
-    const ctx=vm.createContext({document:{activeElement:active,querySelectorAll:()=>[hidden,active]},isVisibleControl:el=>el!==hidden});
-    vm.runInContext(functionSource('getComposerInput'),ctx);
-    assert.equal(ctx.getComposerInput(),active);
+test('recognizes the composer-send-button test id',()=>{
+    const attrs={'data-testid':'composer-send-button'};
+    const button={disabled:false,isConnected:true,id:'',matches:()=>false,closest:()=>null,
+        getAttribute:key=>attrs[key]||null};
+    const root={querySelectorAll:selector=>selector==='button[data-testid="composer-send-button"]'?[button]:[]};
+    const layout={querySelectorAll:()=>[],contains:()=>false};
+    const input={closest:selector=>selector==='main'?null:layout};
+    const main={querySelectorAll:()=>[]};
+    const doc={querySelector:()=>main,querySelectorAll:()=>[]};
+    const ctx=vm.createContext({
+        document:doc,getComposerInput:()=>input,getComposerRoot:()=>root,
+        isVisibleControl:()=>true,normalizeText:text=>String(text||'').trim(),
+        getComposerText:()=> 'Continue'
+    });
+    vm.runInContext(functionSource('getSendButton'),ctx);
+    assert.equal(ctx.getSendButton(),button);
+});
+
+test('composer lookup skips hidden and tiny hydration proxies and prefers rich editor',()=>{
+    const hidden={closest:()=>null,getAttribute:()=>null,getBoundingClientRect:()=>({width:400,height:40}),contains:()=>false};
+    const proxy={closest:()=>null,getAttribute:()=>null,getBoundingClientRect:()=>({width:1,height:1}),contains:()=>false};
+    const textarea={closest:()=>null,getAttribute:()=>null,getBoundingClientRect:()=>({width:400,height:40}),contains:()=>false};
+    const rich={closest:()=>null,getAttribute:k=>k==='contenteditable'?'true':null,getBoundingClientRect:()=>({width:400,height:40}),contains:()=>false};
+    const ctx=vm.createContext({
+        document:{activeElement:textarea,querySelectorAll:()=>[hidden,proxy,textarea,rich]},
+        isVisibleControl:el=>el!==hidden
+    });
+    vm.runInContext(['getComposerCandidates','isUsableComposer','getComposerInput'].map(functionSource).join('\n'),ctx);
+    assert.equal(ctx.getComposerInput(),rich);
+    rich.contains=el=>el===textarea;
+    assert.equal(ctx.getComposerInput(),rich);
+});
+
+test('composer diagnostics expose DOM metadata but never prompt contents',()=>{
+    const sampleText='example continuation text';
+    const editor={
+        tagName:'DIV',id:'prompt-textarea',innerText:sampleText,disabled:false,readOnly:false,
+        getAttribute:key=>key==='contenteditable'?'true':null,
+        getBoundingClientRect:()=>({width:400,height:80}),
+        closest:()=>null,contains:node=>node===editor
+    };
+    const attrs={'data-testid':'composer-send-button','data-composer-submit':'true','type':'submit'};
+    const button={id:'composer-submit-button',disabled:false,
+        getAttribute:key=>attrs[key]||null,closest:()=>null};
+    const main={querySelectorAll:selector=>selector==='button'?[button]:[]};
+    const doc={
+        activeElement:editor,visibilityState:'visible',hasFocus:()=>true,
+        querySelectorAll:()=>[editor],querySelector:()=>main
+    };
+    const ctx=vm.createContext({
+        document:doc,isVisibleControl:()=>true,
+        getComposerText:el=>el?.value??el?.innerText??el?.textContent??''
+    });
+    vm.runInContext([
+        'getComposerCandidates','isUsableComposer','getComposerInput',
+        'getComposerRoot','getComposerText','captureComposerDiagnostic'
+    ].map(functionSource).join('\n'),ctx);
+    const diagnostic=ctx.captureComposerDiagnostic();
+    assert.match(diagnostic,/400x80/);
+    assert.ok(diagnostic.includes('chars=' + sampleText.length));
+    assert.match(diagnostic,/composer-send-button/);
+    assert.equal(diagnostic.includes(sampleText),false);
+});
+
+test('contenteditable insertion uses native editor input before synthetic clipboard paste',()=>{
+    const commands=[];
+    let doc;
+    const editor={
+        isConnected:true,tagName:'DIV',innerText:'',textContent:'',
+        getAttribute:name=>name==='contenteditable'?'true':null,
+        focus(){doc.activeElement=this;},
+        contains(node){return node===this;}
+    };
+    const selection={removeAllRanges(){},addRange(){}};
+    doc={
+        activeElement:null,
+        createRange:()=>({selectNodeContents(){}}),
+        execCommand:(command,_ui,value)=>{
+            commands.push(command);
+            if(command==='insertText') editor.innerText=value;
+            return true;
+        }
+    };
+    const ctx=vm.createContext({
+        document:doc,window:{getSelection:()=>selection},
+        normalizeText:text=>String(text||'').replace(/\s+/g,' ').trim(),
+        getComposerText:el=>el?.value??el?.innerText??el?.textContent??'',
+        composerContainsExpectedText:(el,value)=>String(el?.innerText||'').trim()===String(value).trim()
+    });
+    vm.runInContext([
+        functionSource('selectComposerContents'),
+        functionSource('composerContainsExpectedText'),
+        functionSource('setComposerText')
+    ].join('\n'),ctx);
+    assert.equal(ctx.setComposerText(editor,'Continue'),true);
+    assert.deepEqual(commands,['insertText']);
+    assert.equal(editor.innerText,'Continue');
 });
 
 test('status tooltip preserves the full status and latest diagnostics', () => {
@@ -201,7 +292,7 @@ function submissionFixture({draft = '', accept = true, clickThrows = false, setu
         SUBMIT_DELAY_MS:450, SEND_READY_TIMEOUT_MS:20000, COMPOSER_SYNC_DELAY_MS:2000, SEND_CONFIRM_TIMEOUT_MS:15000,
         Event:class Event {},
         disposed:false, enabled, manualBlockUntil:0, isSubmitting:false, awaitingReply:false,
-        pendingSubmitToken:0, pendingSubmitTimerId:null, pendingOwnedDraft:null, lastSendStage:'',
+        pendingSubmitToken:0, pendingSubmitTimerId:null, pendingOwnedDraft:null, lastSendStage:'', lastComposerDiagnostic:'', captureComposerDiagnostic:()=> 'fixture',
         completionCandidateSinceMs:0, hasCompletedOnce:false, submittedAssistantCount:0,
         submittedAtMs:0, tabRequestStartedAtMs:null, wasGenerating:false, stopNotifiedForCurrentReply:false,
         setTimeout:(fn,delay)=>{state.timer.push({fn,delay});return state.timer.length;},

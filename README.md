@@ -4,7 +4,7 @@
 
 A **Tampermonkey userscript** that automatically continues a [ChatGPT](https://chatgpt.com/) conversation once the assistant has finished responding. It provides a compact floating control panel, configurable stop word, session statistics, and safeguards against sending a follow-up while a response is still being generated.
 
-**Current version:** 1.33  
+**Current version:** 1.34
 **Interface language:** English (default) / Russian  
 **Supported website:** `https://chatgpt.com/*`
 
@@ -24,6 +24,7 @@ A **Tampermonkey userscript** that automatically continues a [ChatGPT](https://c
 - **Stable completion check:** Waits **5 seconds** after all generation indicators disappear, or **10 seconds** if the conversation row is unavailable in the sidebar. If generation resumes, the timer resets.
 - **Duplicate-send prevention:** Rechecks generation immediately before sending. If generation resumes, it cancels the prepared draft as long as the user has not edited it.
 - **Response confirmation:** Does not start another cycle until a new response to the previous message is confirmed. If the response times out, automatic mode is disabled.
+- **Composer recovery (v1.34):** Prefers the visible rich-text editor over hidden or tiny hydration proxies, uses native text insertion first, and records privacy-safe DOM metadata when the composer or Send control cannot be resolved.
 - **Stop word:** Watches for a marker **in the assistant's latest reply**. On detection, it disables automatic continuation and plays a notification sound. Default: `STOP_IT`.
 - **Stop instruction:** Appends configurable stopping criteria to the continuation prompt. The `{STOP_WORD}` placeholder is replaced with the configured marker.
 - **Floating panel:** Enable/disable automation, manually send a message, collapse the panel, drag it, and save its position.
@@ -67,6 +68,14 @@ chatgpt-auto-continue/
 ```
 
 ## Changelog
+
+### v1.34 — New-chat composer recovery
+
+- Prefer the visible rich-text editor over backing textareas and tiny accessibility proxies left during hydration.
+- Use native `insertText` before synthetic clipboard fallback and verify editor focus before insertion.
+- Capture privacy-safe diagnostics (editor dimensions, character counts, button metadata, focus and visibility) when the composer or Send control cannot be resolved. Prompt contents and chat IDs are not recorded.
+- Recognize the additional `composer-send-button` test ID.
+
 
 ### v1.26 — Actionable tab alerts
 

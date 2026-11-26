@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Auto Continue + Floating Panel
 // @namespace    http://tampermonkey.net/
-// @version      1.33
+// @version      1.34
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @description  Auto-continue with conversation activity detection, submission verification, sound alerts and statistics
@@ -192,6 +192,7 @@
     let pendingSubmitToken = 0;
     let pendingOwnedDraft = null;
     let lastSendStage = 'Нет попыток';
+    let lastComposerDiagnostic = '';
     let completionCandidateSinceMs = 0;
     let weakBusySinceMs = 0;
     let weakBusyTextFingerprint = null;
@@ -913,6 +914,7 @@
         }
         currentChatKey = nextKey;
         lastSendStage = 'Нет попыток';
+        lastComposerDiagnostic = '';
         sidebarOnlySinceMs = null;
         sidebarOnlyFingerprint = null;
         assistantActivityFingerprint = null;
@@ -970,22 +972,52 @@
         updateStatsUI();
     }
 
-    function getComposerInput() {
-        // During hydration an old, hidden editor can coexist with the active one.
+    function getComposerCandidates() {
+        // Prefer the actual rich-text editor over legacy backing textareas.
+        // A 1px accessibility proxy can pass a non-zero visibility test.
         const selectors = [
             '#prompt-textarea[contenteditable="true"]',
-            '#prompt-textarea:where(textarea, input)',
             '[data-composer-layout] .ProseMirror[contenteditable="true"], [class*="ComposerLayoutRoot"] .ProseMirror[contenteditable="true"]',
             '.ProseMirror[contenteditable="true"][data-composer-markdown]',
-            'main .ProseMirror[contenteditable="true"], main [role="textbox"][contenteditable="true"]'
+            'main .ProseMirror[contenteditable="true"], main [role="textbox"][contenteditable="true"]',
+            '#prompt-textarea:where(textarea, input)'
         ];
-        for (const selector of selectors) {
-            const candidates = [...document.querySelectorAll(selector)].filter(el =>
-                isVisibleControl(el) && !el.closest('[data-message-author-role], #cgpt-autocont-panel') &&
-                !el.disabled && el.getAttribute('aria-disabled') !== 'true' && !el.readOnly);
-            if (candidates.length) return candidates.find(el => el === document.activeElement) || candidates[0];
-        }
-        return null;
+        return [...new Set(selectors.flatMap(selector => [...document.querySelectorAll(selector)]))];
+    }
+
+    function isUsableComposer(el) {
+        if (!isVisibleControl(el) || el.closest('[data-message-author-role], #cgpt-autocont-panel') ||
+            el.disabled || el.readOnly || el.getAttribute('aria-disabled') === 'true') return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width >= 32 && rect.height >= 12;
+    }
+
+    function getComposerInput() {
+        const candidates = getComposerCandidates().filter(isUsableComposer);
+        const rich = candidates.filter(el => el.getAttribute('contenteditable') === 'true');
+        const preferred = rich.length ? rich : candidates;
+        return preferred.find(el => el === document.activeElement || el.contains(document.activeElement)) || preferred[0] || null;
+    }
+
+    function captureComposerDiagnostic() {
+        // Keep only DOM metadata and lengths, never prompt text or chat IDs.
+        const selected = getComposerInput();
+        const editors = getComposerCandidates().slice(0, 8).map(el => {
+            const rect = el.getBoundingClientRect();
+            return [el === selected ? '*' : '-', el.tagName, el.id || '-',
+                el.getAttribute('contenteditable') === 'true' ? 'rich' : 'plain',
+                Math.round(rect.width) + 'x' + Math.round(rect.height),
+                'usable=' + isUsableComposer(el), 'chars=' + getComposerText(el).length].join(' ');
+        });
+        const scopes = [getComposerRoot(), selected?.closest('[data-composer-layout], [class*="ComposerLayoutRoot"]')].filter(Boolean);
+        const buttons = [...new Set(scopes.flatMap(scope => [...scope.querySelectorAll('button')]))]
+            .filter(btn => isVisibleControl(btn) && !btn.closest('[data-message-author-role], #cgpt-autocont-panel'))
+            .slice(0, 14).map(btn => [btn.id || '-', btn.getAttribute('data-testid') || '-',
+                btn.getAttribute('data-composer-submit') || '-', btn.getAttribute('type') || '-',
+                'disabled=' + Boolean(btn.disabled || btn.getAttribute('aria-disabled') === 'true')].join(' '));
+        return ['Focus=' + document.hasFocus() + '; visibility=' + document.visibilityState,
+            'Editors (* selected): ' + (editors.join(' | ') || 'none'),
+            'Controls (id/testid/submit/type): ' + (buttons.join(' | ') || 'none')].join('\n');
     }
 
     function getComposerRoot() {
@@ -1209,6 +1241,7 @@
         const main = input.closest('main') || document.querySelector('main');
         const stableSelectors = [
             'button[data-testid="send-button"]',
+            'button[data-testid="composer-send-button"]',
             'button[data-composer-submit="true"]',
             'button#composer-submit-button'
         ];
@@ -1230,7 +1263,7 @@
                 btn.matches('[data-composer-stop="true"], [data-composer-voice-start="true"], [data-testid="stop-button"], [data-testid="composer-stop-button"]')) continue;
             const labels = ['aria-label', 'title', 'data-tooltip-content', 'data-testid'].map(attr => btn.getAttribute(attr) || '');
             if (labels.some(label => /stop|voice|dictat|record|microphone|останов|голос|диктов|запись|микрофон/iu.test(label))) continue;
-            const explicitSend = btn.getAttribute('data-testid') === 'send-button' ||
+            const explicitSend = ['send-button', 'composer-send-button'].includes(btn.getAttribute('data-testid')) ||
                 btn.getAttribute('data-composer-submit') === 'true' ||
                 labels.some(label => /^(?:send(?: message| prompt| request)?|отправить(?: сообщение| промпт| запрос)?)$/iu.test(label.trim()));
             const associatedSubmit = btn.id === 'composer-submit-button' && draftPresent &&
@@ -1381,6 +1414,7 @@
             if (!el.isConnected || getComposerText(el).trim()) return false;
             try {
                 el.focus();
+                if (document.activeElement !== el && !el.contains(document.activeElement)) return false;
                 if (!selectComposerContents(el)) return false;
                 operation();
             } catch (_) {}
@@ -1389,7 +1423,10 @@
             return composerContainsExpectedText(el, value);
         };
 
-        // Clipboard paste is handled by ProseMirror and preserves multiline text.
+        // Prefer the browser's native editing operation: unlike synthetic paste,
+        // it emits the normal editing events into the active editor.
+        if (attempt(() => document.execCommand('insertText', false, value))) return true;
+        // Clipboard paste is the fallback for editors that require it.
         if (attempt(() => {
             if (typeof DataTransfer === 'undefined' || typeof ClipboardEvent === 'undefined') return;
             const data = new DataTransfer();
@@ -1400,7 +1437,6 @@
                 clipboardData: data
             }));
         })) return true;
-        if (attempt(() => document.execCommand('insertText', false, value))) return true;
 
         // Some Chromium editor versions accept HTML insertion but not plain
         // insertText. Escape all user-supplied content before building markup.
@@ -1634,8 +1670,10 @@
             return;
         }
 
+        lastComposerDiagnostic = '';
         const input = getComposerInput();
         if (!input) {
+            lastComposerDiagnostic = captureComposerDiagnostic();
             showTabNotice('error', 'Поле ввода не найдено');
             return;
         }
@@ -1649,6 +1687,7 @@
         }
         lastSendStage = existingDraft ? 'Повтор: готовый черновик' : 'Заполнение редактора';
         if (!textToSend.trim() || (!existingDraft && !setComposerText(input, textToSend))) {
+            lastComposerDiagnostic = captureComposerDiagnostic();
             showTabNotice('error', 'Не удалось заполнить поле ввода');
             return;
         }
@@ -1682,6 +1721,7 @@
             }
             // The user may have modified the draft while waiting.
             if (!composerContainsExpectedText(getComposerInput(), textToSend)) {
+                lastComposerDiagnostic = captureComposerDiagnostic();
                 cancelPendingSend();
                 showTabNotice('warning', 'Черновик изменён — отправка отменена');
                 return;
@@ -1749,6 +1789,7 @@
                 liveInput.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
             }
             if (waitingMs >= SEND_READY_TIMEOUT_MS) {
+                lastComposerDiagnostic = captureComposerDiagnostic();
                 lastSendStage = 'Кнопка отправки недоступна';
                 pendingOwnedDraft = null; // Preserve the draft for manual recovery.
                 pauseForUiFailure('error', 'Кнопка отправки недоступна');
@@ -2285,8 +2326,9 @@
                 tr('Атрибут busy: ') + (signals.replyFlag ? tr('да') : tr('нет')),
                 tr('Busy устарел: ') + (signals.staleReplyFlag ? tr('да') : tr('нет')),
                 tr('Отправка доступна: ') + (signals.sendReady ? tr('да') : tr('нет')),
-                tr('Редактор доступен: ') + (signals.composerEditable ? tr('да') : tr('нет'))
-            ].join('\n'));
+                tr('Редактор доступен: ') + (signals.composerEditable ? tr('да') : tr('нет')),
+                lastComposerDiagnostic
+            ].filter(Boolean).join('\n'));
         }
 
         // A stale reply flag is ambiguous: the user might have pressed Stop,
