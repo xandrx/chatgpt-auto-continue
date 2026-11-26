@@ -107,18 +107,33 @@ test('click or unchanged previous user turn is not confirmation', () => {
 });
 
 test('finds enabled real send button even when preferred selector is disabled', () => {
-    const disabled = {disabled:true, matches:()=>false,getAttribute:()=>null};
-    const ready = {disabled:false,matches:()=>false,getAttribute:()=>null};
-    const hidden = {disabled:false,matches:()=>false,getAttribute:()=>null};
-    const stop = {disabled:false,matches:()=>true,getAttribute:()=>null};
+    const button = (attrs, options={}) => ({disabled:false, matches:()=>false, closest:()=>null, getAttribute:k=>attrs[k]||null,...options});
+    const disabled = button({'data-testid':'send-button'},{disabled:true});
+    const ready = button({'aria-label':'Send prompt'});
+    const hidden = button({'data-testid':'send-button'});
+    const stop = button({'aria-label':'Stop generating'},{matches:()=>true});
+    const voice = button({'aria-label':'Start voice mode'},{id:'composer-submit-button'});
+    const form = {querySelectorAll:selector=>selector==='button[data-testid="send-button"]'?[hidden,disabled,stop]:[]};
+    const layout = {querySelectorAll:selector=>selector==='button#composer-submit-button'?[voice,ready]:[],contains:()=>true};
+    const input = {closest:selector=>selector==='form'?form:selector==='main'?null:layout};
+    const doc = {querySelector:()=>null,querySelectorAll:()=>[]};
     const ctx = vm.createContext({
         isVisibleControl: btn => btn !== hidden,
-        getComposerRoot:()=>({querySelectorAll: selector =>
-            selector === 'button[data-testid="send-button"]' ? [hidden,disabled,stop] :
-            selector === 'button#composer-submit-button' ? [ready] : []})
+        getComposerRoot:()=>form, getComposerInput:()=>input, document:doc,
+        normalizeText:s=>s.trim(),getComposerText:()=> 'Continue'
     });
     vm.runInContext(functionSource('getSendButton'),ctx);
     assert.equal(ctx.getSendButton(),ready);
+    layout.querySelectorAll=selector=>selector==='button#composer-submit-button'?[voice]:[];
+    assert.equal(ctx.getSendButton(),disabled); // never choose the enabled voice control
+});
+
+test('composer lookup skips a hidden duplicate left by hydration',()=>{
+    const hidden={closest:()=>null,getAttribute:()=>null};
+    const active={closest:()=>null,getAttribute:()=>null};
+    const ctx=vm.createContext({document:{activeElement:active,querySelectorAll:()=>[hidden,active]},isVisibleControl:el=>el!==hidden});
+    vm.runInContext(functionSource('getComposerInput'),ctx);
+    assert.equal(ctx.getComposerInput(),active);
 });
 
 test('status tooltip preserves the full status and latest diagnostics', () => {
@@ -178,12 +193,13 @@ test('streaming indicator on assistant turn wrapper is recognized', () => {
     assert.equal(ctx.getAssistantStreamingFlag().active,true);
 });
 
-function submissionFixture({draft = '', accept = true, clickThrows = false, setupThrows = false, enabled = true, acceptance = 'user'} = {}) {
+function submissionFixture({draft = '', accept = true, clickThrows = false, setupThrows = false, enabled = true, acceptance = 'user', readyAfter = 0} = {}) {
     const state = {now:1000, clicks:0, count:0, user:{count:1,id:'old',text:'Previous'}, errors:[], timer:[], status:'', insertions:0, stop:false, assistantText:'Previous reply'};
-    const editor = {value:draft};
+    const editor = {value:draft,dispatchEvent:()=>{state.syncs=(state.syncs||0)+1;}};
     const ctx = vm.createContext({
         Date:{now:()=>state.now},
-        SUBMIT_DELAY_MS:450, SEND_READY_TIMEOUT_MS:5000, SEND_CONFIRM_TIMEOUT_MS:15000,
+        SUBMIT_DELAY_MS:450, SEND_READY_TIMEOUT_MS:20000, COMPOSER_SYNC_DELAY_MS:2000, SEND_CONFIRM_TIMEOUT_MS:15000,
+        Event:class Event {},
         disposed:false, enabled, manualBlockUntil:0, isSubmitting:false, awaitingReply:false,
         pendingSubmitToken:0, pendingSubmitTimerId:null, pendingOwnedDraft:null, lastSendStage:'',
         completionCandidateSinceMs:0, hasCompletedOnce:false, submittedAssistantCount:0,
@@ -201,7 +217,7 @@ function submissionFixture({draft = '', accept = true, clickThrows = false, setu
         setComposerText:(el,text)=>{state.insertions++;el.value=text;return true;},
         getConversationKey:()=>{if(setupThrows)throw new ReferenceError('mock failure');return 'chat:abc';},
         getAssistantElements:()=>[{textContent:state.assistantText}], getUserMessageSnapshot:()=>({...state.user}),
-        getSendButton:()=>({disabled:false,isConnected:true,getAttribute:()=>null,id:'composer-submit-button',
+        getSendButton:()=>state.now-1000<readyAfter?null:({disabled:false,isConnected:true,getAttribute:()=>null,id:'composer-submit-button',
             click:()=>{
                 state.clicks++;
                 if(clickThrows)throw new Error('click failed');
@@ -229,7 +245,7 @@ function submissionFixture({draft = '', accept = true, clickThrows = false, setu
     });
     vm.runInContext(['generationBlocksSend','getAssistantSnapshot','hasAssistantAdvanced','isSubmissionConfirmed','triggerSend','handleSubmissionException',
         'scheduleSendStep','runContinueNow','performContinuation'].map(functionSource).join('\n'),ctx);
-    const drain=()=>{for(let i=0;state.timer.length;i++){assert.ok(i<100,'timer loop');const next=state.timer.shift();state.now+=next.delay;next.fn();}};
+    const drain=()=>{for(let i=0;state.timer.length;i++){assert.ok(i<200,'timer loop');const next=state.timer.shift();state.now+=next.delay;next.fn();}};
     return {ctx,state,editor,drain};
 }
 
@@ -247,6 +263,27 @@ test('manual send completes entire workflow from empty editor to confirmation',(
     assert.equal(f.ctx.isSubmitting,false);
     assert.equal(f.ctx.awaitingReply,true);
     assert.deepEqual(f.state.errors,[]);
+});
+
+test('new tab waits for late send control and syncs composer once',()=>{
+    const f=submissionFixture({readyAfter:8000});
+    f.ctx.runContinueNow(true);f.drain();
+    assert.equal(f.state.clicks,1);
+    assert.equal(f.state.count,1);
+    assert.equal(f.state.syncs,1);
+    assert.equal(f.ctx.enabled,true);
+    assert.deepEqual(f.state.errors,[]);
+});
+
+test('missing send control times out without clicking or discarding draft',()=>{
+    const f=submissionFixture({readyAfter:30000});
+    f.ctx.runContinueNow(true);f.drain();
+    assert.equal(f.state.clicks,0);
+    assert.equal(f.state.count,0);
+    assert.equal(f.state.syncs,1);
+    assert.equal(f.editor.value,'Continue');
+    assert.equal(f.ctx.enabled,false);
+    assert.match(f.state.errors[0],/Кнопка отправки недоступна/);
 });
 
 test('manual retry submits matching existing draft without inserting it again',()=>{

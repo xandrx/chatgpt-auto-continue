@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Auto Continue + Floating Panel
 // @namespace    http://tampermonkey.net/
-// @version      1.32
+// @version      1.33
 // @updateURL    https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @downloadURL  https://raw.githubusercontent.com/xandrx/chatgpt-auto-continue/main/chatgpt_auto_continue.user.js
 // @description  Auto-continue with conversation activity detection, submission verification, sound alerts and statistics
@@ -36,7 +36,8 @@
     const TAB_ACTIVITY_WINDOW_MS = 2400;
     const SUBMIT_DELAY_MS = 450;
     // Do not treat a quiet response as finished: thinking/tool calls can take minutes.
-    const SEND_READY_TIMEOUT_MS = 5000;
+    const SEND_READY_TIMEOUT_MS = 20000;
+    const COMPOSER_SYNC_DELAY_MS = 2000;
     const SEND_CONFIRM_TIMEOUT_MS = 15000;
     const RESPONSE_WAIT_TIMEOUT_MS = 90000;
     // The sidebar is a stronger positive indicator than the temporary Send button.
@@ -105,6 +106,7 @@
         "Клик без подтверждения": "Click not confirmed",
         "Отправка не подтверждена — проверьте черновик": "Submission not confirmed — check draft",
         "Кнопка отправки недоступна": "Send button unavailable",
+        "Синхронизация редактора": "Synchronizing composer",
         "Ошибка отправки: ": "Submission error: ",
         "Перетащить панель": "Drag widget",
         "Число продолжений в текущем чате": "Continuations in this conversation",
@@ -969,17 +971,21 @@
     }
 
     function getComposerInput() {
-        const scope = document.querySelector('[data-composer-layout]') ||
-            document.querySelector('[class*="ComposerLayoutRoot"]') ||
-            document.querySelector('main') || document;
-        return (
-            document.querySelector('#prompt-textarea[contenteditable="true"]') ||
-            document.querySelector('#prompt-textarea:where(textarea, input)') ||
-            scope.querySelector('div.ProseMirror[contenteditable="true"][data-composer-markdown]') ||
-            scope.querySelector('div.ProseMirror[contenteditable="true"]') ||
-            scope.querySelector('[role="textbox"][contenteditable="true"]') ||
-            document.querySelector('div.ProseMirror[contenteditable="true"][data-composer-markdown]')
-        );
+        // During hydration an old, hidden editor can coexist with the active one.
+        const selectors = [
+            '#prompt-textarea[contenteditable="true"]',
+            '#prompt-textarea:where(textarea, input)',
+            '[data-composer-layout] .ProseMirror[contenteditable="true"], [class*="ComposerLayoutRoot"] .ProseMirror[contenteditable="true"]',
+            '.ProseMirror[contenteditable="true"][data-composer-markdown]',
+            'main .ProseMirror[contenteditable="true"], main [role="textbox"][contenteditable="true"]'
+        ];
+        for (const selector of selectors) {
+            const candidates = [...document.querySelectorAll(selector)].filter(el =>
+                isVisibleControl(el) && !el.closest('[data-message-author-role], #cgpt-autocont-panel') &&
+                !el.disabled && el.getAttribute('aria-disabled') !== 'true' && !el.readOnly);
+            if (candidates.length) return candidates.find(el => el === document.activeElement) || candidates[0];
+        }
+        return null;
     }
 
     function getComposerRoot() {
@@ -1196,23 +1202,44 @@
     }
 
     function getSendButton() {
+        const input = getComposerInput();
+        if (!input) return null;
         const root = getComposerRoot();
-        if (!root) return null;
-        const selectors = [
+        const layout = input.closest('[data-composer-layout], [class*="ComposerLayoutRoot"]');
+        const main = input.closest('main') || document.querySelector('main');
+        const stableSelectors = [
             'button[data-testid="send-button"]',
-            'button#composer-submit-button',
             'button[data-composer-submit="true"]',
-            'button[aria-label="Отправить"], button[aria-label="Отправить сообщение"], button[aria-label="Send"], button[aria-label="Send message"]',
-            '[data-composer-trailing-controls="true"] button.bg-composer-primary:not([data-composer-voice-start="true"])'
+            'button#composer-submit-button'
         ];
+        const candidates = new Set();
+        // A submit button may be a sibling of the form, not a child.
+        for (const scope of new Set([root, layout, main, document].filter(Boolean))) {
+            for (const selector of stableSelectors) {
+                for (const btn of scope.querySelectorAll(selector)) candidates.add(btn);
+            }
+        }
+        // Localized accessible names and tooltips cover additional composer variants.
+        for (const scope of new Set([root, layout, main].filter(Boolean))) {
+            for (const btn of scope.querySelectorAll('button[aria-label], button[title], button[data-tooltip-content]')) candidates.add(btn);
+        }
+        const draftPresent = Boolean(normalizeText(getComposerText(input)));
         let disabledCandidate = null;
-        for (const selector of selectors) {
-            const candidates = [...root.querySelectorAll(selector)].filter(btn =>
-                isVisibleControl(btn) && !btn.matches('[data-composer-stop="true"], [data-composer-voice-start="true"], [data-testid="stop-button"]') &&
-                !/stop|voice|останов|голос/iu.test(btn.getAttribute('aria-label') || ''));
-            const ready = candidates.find(btn => !btn.disabled && btn.getAttribute('aria-disabled') !== 'true');
-            if (ready) return ready;
-            if (!disabledCandidate && candidates.length) disabledCandidate = candidates[0];
+        for (const btn of candidates) {
+            if (!isVisibleControl(btn) || btn.closest('[data-message-author-role], #cgpt-autocont-panel') ||
+                btn.matches('[data-composer-stop="true"], [data-composer-voice-start="true"], [data-testid="stop-button"], [data-testid="composer-stop-button"]')) continue;
+            const labels = ['aria-label', 'title', 'data-tooltip-content', 'data-testid'].map(attr => btn.getAttribute(attr) || '');
+            if (labels.some(label => /stop|voice|dictat|record|microphone|останов|голос|диктов|запись|микрофон/iu.test(label))) continue;
+            const explicitSend = btn.getAttribute('data-testid') === 'send-button' ||
+                btn.getAttribute('data-composer-submit') === 'true' ||
+                labels.some(label => /^(?:send(?: message| prompt| request)?|отправить(?: сообщение| промпт| запрос)?)$/iu.test(label.trim()));
+            const associatedSubmit = btn.id === 'composer-submit-button' && draftPresent &&
+                btn.getAttribute('type') === 'submit' &&
+                (btn.form === input.closest('form') && Boolean(btn.form) || Boolean(layout?.contains(btn)));
+            // Do not click a generic primary button: it can be voice mode.
+            if (!explicitSend && !associatedSubmit) continue;
+            if (!btn.disabled && btn.getAttribute('aria-disabled') !== 'true') return btn;
+            if (!disabledCandidate) disabledCandidate = btn;
         }
         return disabledCandidate;
     }
@@ -1634,6 +1661,7 @@
         setStatus('Отправка...', 'send');
         setTabIndicator('working');
         const startedAt = Date.now();
+        let composerSyncAttempted = false;
 
         const attemptSend = () => {
             if (disposed || submissionId !== pendingSubmitToken ||
@@ -1711,7 +1739,16 @@
                 confirmSend();
                 return;
             }
-            if (Date.now() - startedAt >= SEND_READY_TIMEOUT_MS) {
+            const waitingMs = Date.now() - startedAt;
+            const liveInput = getComposerInput();
+            if (!composerSyncAttempted && waitingMs >= COMPOSER_SYNC_DELAY_MS &&
+                composerContainsExpectedText(liveInput, textToSend)) {
+                composerSyncAttempted = true;
+                lastSendStage = 'Синхронизация редактора';
+                // Let the app reconcile its editor state; never simulate Enter or click voice.
+                liveInput.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+            }
+            if (waitingMs >= SEND_READY_TIMEOUT_MS) {
                 lastSendStage = 'Кнопка отправки недоступна';
                 pendingOwnedDraft = null; // Preserve the draft for manual recovery.
                 pauseForUiFailure('error', 'Кнопка отправки недоступна');
