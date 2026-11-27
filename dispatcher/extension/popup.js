@@ -91,7 +91,7 @@ $('register').addEventListener('click', async () => {
     await refreshState();
   } catch (error) {
     $('status').textContent = String(error?.message || 'Registration failed') +
-      ' — check DISPATCHER_EXTENSION_ORIGIN and restart the local server.';
+      ' — check the VPS origin configuration and dispatcher service.';
     $('register').disabled = false;
   }
 });
