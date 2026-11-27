@@ -12,7 +12,7 @@ use axum::{
 use chatgpt_session_dispatcher::{digest, now, same_digest, Client, Error, Store};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, time::Duration};
 
 #[derive(Clone)]
 struct App {
@@ -737,6 +737,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(env::VarError::NotPresent) => None,
         Err(_) => return Err(std::io::Error::other("invalid extension origin").into()),
     };
+    let retry_store = store.clone();
+    tokio::spawn(async move {
+        loop {
+            if retry_store.process_retries(now()).await.is_err() {
+                tracing::error!("dispatcher retry scheduler tick failed");
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
     let app = App {
         store,
         operator_digest: digest(&credential),

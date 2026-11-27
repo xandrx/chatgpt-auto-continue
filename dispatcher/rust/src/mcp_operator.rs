@@ -159,11 +159,21 @@ impl Operator {
         serialize(&result)
     }
 
-    #[tool(description = "Read status by exact request ID. Never returns prompt or result text.")]
+    #[tool(
+        description = "Read status by exact request ID, including the current retry attempt and delivery state. Never returns prompt or result text."
+    )]
     async fn get_task_status(
         &self,
         Parameters(req): Parameters<JobRequest>,
     ) -> Result<String, McpError> {
+        if let Some(status) = self
+            .store
+            .dispatch_task_status(&req.request_id, now())
+            .await
+            .map_err(map_store_error)?
+        {
+            return serialize(&status);
+        }
         let status = self
             .store
             .observe_job(&req.request_id, now())
@@ -194,7 +204,7 @@ impl Operator {
     }
 
     #[tool(
-        description = "Queue a previously prepared task exactly once. Call ONLY after the user explicitly approved the exact prompt returned by prepare_task in the current conversation. Set user_confirmed=true only when that approval was actually given. This tool sends the prompt to the selected ChatGPT session when its browser client is idle."
+        description = "Queue a previously prepared task exactly once after explicit user approval. The dispatcher automatically retries only attempts that expire while still queued, up to three attempts within a ten-minute delivery window, with a 30-second delay between attempts. It never replays claimed, submitted, or uncertain work; unresolved delivery is marked uncertain for operator review."
     )]
     async fn confirm_task(
         &self,

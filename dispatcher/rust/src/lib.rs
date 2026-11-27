@@ -19,11 +19,17 @@ use tokio::{
 };
 use uuid::Uuid;
 
-pub const LEASE_SECONDS: i64 = 45;
+// Background tabs may have their content-script timers heavily throttled.
+// Keep a longer lease than the normal heartbeat interval so a healthy tab
+// does not lose its worker fence during a temporary scheduling delay.
+pub const LEASE_SECONDS: i64 = 180;
 pub const MAX_PROMPT: usize = 20_000;
 pub const MAX_RESULT: usize = 40_000;
 pub const MAX_WAIT_MS: u64 = 25_000;
 const MAX_WAITERS: usize = 256;
+const DELIVERY_MAX_ATTEMPTS: i64 = 3;
+const DELIVERY_RETRY_DELAY_SECONDS: i64 = 30;
+const DELIVERY_WINDOW_SECONDS: i64 = 600;
 
 #[derive(Debug)]
 pub enum Error {
@@ -147,6 +153,32 @@ pub struct JobObservation {
     pub created: i64,
     pub updated: i64,
     pub expires: i64,
+}
+#[derive(Debug, FromRow)]
+struct DispatchTask {
+    request_id: String,
+    session_id: String,
+    prompt: String,
+    attempt: i64,
+    max_attempts: i64,
+    ttl_seconds: i64,
+    retry_delay_seconds: i64,
+    deadline: i64,
+    current_job_id: String,
+    next_retry_at: i64,
+    state: String,
+}
+#[derive(Debug, Serialize)]
+pub struct DispatchTaskStatus {
+    pub request_id: String,
+    pub session_id: String,
+    pub current_job_id: String,
+    pub attempt: i64,
+    pub max_attempts: i64,
+    pub state: String,
+    pub current_job_state: String,
+    pub next_retry_at: i64,
+    pub deadline: i64,
 }
 #[derive(Debug, Serialize, FromRow)]
 pub struct PreparedTask {
@@ -435,7 +467,8 @@ impl Store {
         if let Some(job) = previous {
             if job.session_id != session_id
                 || job.prompt != prompt
-                || job.expires - job.created != ttl
+                || (job.expires - job.created != ttl
+                    && job.expires - job.created != ttl.min(DELIVERY_WINDOW_SECONDS))
             {
                 return Err(Error::Conflict("request_id conflict"));
             }
@@ -445,8 +478,21 @@ impl Store {
         if !Self::session(&mut tx, session_id).await?.enabled {
             return Err(Error::Conflict("session revoked"));
         }
+        let deadline = time + DELIVERY_WINDOW_SECONDS;
+        let expires = (time + ttl).min(deadline);
         sqlx::query("INSERT INTO jobs(id,session_id,prompt,state,created,updated,expires) VALUES(?,?,?,'queued',?,?,?)")
-            .bind(id).bind(session_id).bind(prompt).bind(time).bind(time).bind(time + ttl)
+            .bind(id).bind(session_id).bind(prompt).bind(time).bind(time).bind(expires)
+            .execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO dispatch_tasks(request_id,session_id,prompt,attempt,max_attempts,ttl_seconds,retry_delay_seconds,deadline,current_job_id,next_retry_at,state) VALUES(?,?,?,1,?,?,?,?,?,?,'active')")
+            .bind(id)
+            .bind(session_id)
+            .bind(prompt)
+            .bind(DELIVERY_MAX_ATTEMPTS)
+            .bind(ttl)
+            .bind(DELIVERY_RETRY_DELAY_SECONDS)
+            .bind(deadline)
+            .bind(id)
+            .bind((expires + DELIVERY_RETRY_DELAY_SECONDS).min(deadline))
             .execute(&mut *tx).await?;
         let job = Self::job_tx(&mut tx, id).await?;
         tx.commit().await?;
@@ -475,6 +521,156 @@ impl Store {
         validate(id, 128, "request_id")?;
         sqlx::query_as("SELECT j.id,j.session_id,CASE WHEN j.state='queued' AND j.expires<=? THEN 'expired' WHEN j.state IN ('claimed','submitted') AND (s.enabled=0 OR s.epoch<>j.epoch OR s.lease_until<=?) THEN 'uncertain' ELSE j.state END AS state,j.created,j.updated,j.expires FROM jobs j JOIN sessions s ON s.id=j.session_id WHERE j.id=?")
             .bind(time).bind(time).bind(id).fetch_optional(&self.pool).await?.ok_or(Error::NotFound)
+    }
+    pub async fn dispatch_task_status(
+        &self,
+        request_id: &str,
+        time: i64,
+    ) -> Result<Option<DispatchTaskStatus>> {
+        validate(request_id, 128, "request_id")?;
+        let task: Option<DispatchTask> =
+            sqlx::query_as("SELECT * FROM dispatch_tasks WHERE request_id=?")
+                .bind(request_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(task) = task else {
+            return Ok(None);
+        };
+        let current = self.observe_job(&task.current_job_id, time).await?;
+        Ok(Some(DispatchTaskStatus {
+            request_id: task.request_id,
+            session_id: task.session_id,
+            current_job_id: task.current_job_id,
+            attempt: task.attempt,
+            max_attempts: task.max_attempts,
+            state: task.state,
+            current_job_state: current.state,
+            next_retry_at: task.next_retry_at,
+            deadline: task.deadline,
+        }))
+    }
+    /// Advance durable delivery retries. Only jobs that expired while still
+    /// queued are eligible; claimed/submitted/uncertain jobs are never replayed.
+    pub async fn process_retries(&self, time: i64) -> Result<usize> {
+        let candidates: Vec<DispatchTask> = sqlx::query_as(
+            "SELECT * FROM dispatch_tasks WHERE state IN ('active','in_progress') ORDER BY next_retry_at LIMIT 100",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut changed = 0usize;
+        for candidate in candidates {
+            let mut tx = self.pool.begin().await?;
+            let task: Option<DispatchTask> = sqlx::query_as(
+                "SELECT * FROM dispatch_tasks WHERE request_id=? AND state IN ('active','in_progress')",
+            )
+            .bind(&candidate.request_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(task) = task else {
+                tx.commit().await?;
+                continue;
+            };
+            // A lease loss turns an in-flight attempt into an ambiguity, never
+            // into a retry. The operator must review that outcome.
+            sqlx::query("UPDATE jobs SET state='uncertain',updated=? WHERE id=? AND state IN ('claimed','submitted') AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id=jobs.session_id AND s.enabled=1 AND s.epoch=jobs.epoch AND s.lease_until>?)")
+                .bind(time)
+                .bind(&task.current_job_id)
+                .bind(time)
+                .execute(&mut *tx)
+                .await?;
+            let mut job = Self::job_tx(&mut tx, &task.current_job_id).await?;
+            if job.state == "queued" && job.expires <= time {
+                sqlx::query("UPDATE jobs SET state='expired',updated=? WHERE id=? AND state='queued' AND expires<=?")
+                    .bind(time)
+                    .bind(&task.current_job_id)
+                    .bind(time)
+                    .execute(&mut *tx)
+                    .await?;
+                job = Self::job_tx(&mut tx, &task.current_job_id).await?;
+            }
+            let mut notify_session = false;
+            match job.state.as_str() {
+                "claimed" | "submitted" => {
+                    sqlx::query("UPDATE dispatch_tasks SET state='in_progress',prompt='' WHERE request_id=?")
+                        .bind(&task.request_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                "completed" | "failed" | "uncertain" | "canceled" => {
+                    sqlx::query("UPDATE dispatch_tasks SET state=?,prompt='' WHERE request_id=?")
+                        .bind(&job.state)
+                        .bind(&task.request_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                "expired" => {
+                    if task.attempt >= task.max_attempts || time >= task.deadline {
+                        sqlx::query("UPDATE jobs SET state='canceled',updated=? WHERE id=? AND state='expired'")
+                            .bind(time)
+                            .bind(&task.current_job_id)
+                            .execute(&mut *tx)
+                            .await?;
+                        sqlx::query("UPDATE dispatch_tasks SET state='canceled',prompt='' WHERE request_id=?")
+                            .bind(&task.request_id)
+                            .execute(&mut *tx)
+                            .await?;
+                    } else if time >= task.next_retry_at {
+                        let next_id = Uuid::new_v4().to_string();
+                        let expires = (time + task.ttl_seconds).min(task.deadline);
+                        if expires <= time {
+                            sqlx::query("UPDATE dispatch_tasks SET state='canceled',prompt='' WHERE request_id=?")
+                                .bind(&task.request_id)
+                                .execute(&mut *tx)
+                                .await?;
+                        } else {
+                            sqlx::query("INSERT INTO jobs(id,session_id,prompt,state,created,updated,expires) VALUES(?,?,?,'queued',?,?,?)")
+                                .bind(&next_id)
+                                .bind(&task.session_id)
+                                .bind(&task.prompt)
+                                .bind(time)
+                                .bind(time)
+                                .bind(expires)
+                                .execute(&mut *tx)
+                                .await?;
+                            sqlx::query("UPDATE dispatch_tasks SET attempt=attempt+1,current_job_id=?,next_retry_at=?,state='active' WHERE request_id=?")
+                                .bind(&next_id)
+                                .bind((expires + task.retry_delay_seconds).min(task.deadline))
+                                .bind(&task.request_id)
+                                .execute(&mut *tx)
+                                .await?;
+                            notify_session = true;
+                        }
+                    }
+                }
+                "queued" => {
+                    if time >= task.deadline {
+                        sqlx::query("UPDATE jobs SET state='canceled',updated=? WHERE id=? AND state='queued'")
+                            .bind(time)
+                            .bind(&task.current_job_id)
+                            .execute(&mut *tx)
+                            .await?;
+                        sqlx::query("UPDATE dispatch_tasks SET state='canceled',prompt='' WHERE request_id=?")
+                            .bind(&task.request_id)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                }
+                _ => {
+                    sqlx::query(
+                        "UPDATE dispatch_tasks SET state='uncertain',prompt='' WHERE request_id=?",
+                    )
+                    .bind(&task.request_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            tx.commit().await?;
+            if notify_session {
+                self.notify_change(&task.session_id);
+            }
+            changed += 1;
+        }
+        Ok(changed)
     }
     /// Persist a proposed MCP task without making it visible to the worker queue.
     /// A pending approval is short-lived and unique per session.
@@ -508,7 +704,9 @@ impl Store {
         .await?;
         let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE session_id=? AND state IN ('claimed','submitted','uncertain')")
             .bind(session_id).fetch_one(&mut *tx).await?;
-        if pending > 0 || queued > 0 || active > 0 {
+        let retrying: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dispatch_tasks WHERE session_id=? AND state IN ('active','in_progress','uncertain')")
+            .bind(session_id).fetch_one(&mut *tx).await?;
+        if pending > 0 || queued > 0 || active > 0 || retrying > 0 {
             return Err(Error::Conflict(
                 "session already has a pending or unresolved task",
             ));
@@ -564,8 +762,21 @@ impl Store {
                 "session already has a pending or unresolved task",
             ));
         }
+        let deadline = time + DELIVERY_WINDOW_SECONDS;
+        let first_expires = (time + row.ttl_seconds).min(deadline);
         sqlx::query("INSERT INTO jobs(id,session_id,prompt,state,created,updated,expires) VALUES(?,?,?,'queued',?,?,?)")
-            .bind(&row.request_id).bind(&row.session_id).bind(&row.prompt).bind(time).bind(time).bind(time+row.ttl_seconds)
+            .bind(&row.request_id).bind(&row.session_id).bind(&row.prompt).bind(time).bind(time).bind(first_expires)
+            .execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO dispatch_tasks(request_id,session_id,prompt,attempt,max_attempts,ttl_seconds,retry_delay_seconds,deadline,current_job_id,next_retry_at,state) VALUES(?,?,?,1,?,?,?,?,?,?,'active')")
+            .bind(&row.request_id)
+            .bind(&row.session_id)
+            .bind(&row.prompt)
+            .bind(DELIVERY_MAX_ATTEMPTS)
+            .bind(row.ttl_seconds)
+            .bind(DELIVERY_RETRY_DELAY_SECONDS)
+            .bind(deadline)
+            .bind(&row.request_id)
+            .bind((first_expires + DELIVERY_RETRY_DELAY_SECONDS).min(deadline))
             .execute(&mut *tx).await?;
         sqlx::query("UPDATE mcp_approvals SET state='queued',job_id=?,prompt='' WHERE id=? AND state='pending'")
             .bind(&row.request_id).bind(approval_id).execute(&mut *tx).await?;
@@ -637,9 +848,14 @@ impl Store {
             return Ok(job);
         }
         let session = Self::session(&mut tx, &job.session_id).await?;
-        if session.lease_until > time {
+        // A live replacement worker is safe to review only after it has fenced
+        // the worker/epoch that owned this ambiguous job. The old worker can
+        // no longer acknowledge or mutate the job once the epoch changes.
+        let old_worker_still_fenced =
+            session.worker.as_deref() != job.worker.as_deref() || job.epoch != Some(session.epoch);
+        if session.lease_until > time && !old_worker_still_fenced {
             return Err(Error::Conflict(
-                "stop the worker and wait for lease expiration before review",
+                "stop the worker or wait until the ambiguous job's worker is fenced",
             ));
         }
         if !matches!(job.state.as_str(), "uncertain" | "claimed" | "submitted") {
@@ -868,18 +1084,53 @@ mod tests {
             .heartbeat(&other, &e.credential, "idle", 103)
             .await
             .is_err());
+        // A background-tab scheduling gap must not fence the same worker
+        // while its lease is still valid.
+        s.heartbeat(&c, &e.credential, "busy", 240).await.unwrap();
+        assert_eq!(s.job("r1", 240).await.unwrap().state, "claimed");
         other.epoch = s
-            .heartbeat(&other, &e.credential, "idle", 146)
+            .heartbeat(&other, &e.credential, "idle", 421)
             .await
             .unwrap()
             .epoch;
         assert!(s
-            .ack(&c, &e.credential, "r1", "submitted", "", 147)
+            .ack(&c, &e.credential, "r1", "submitted", "", 422)
             .await
             .is_err());
-        assert_eq!(s.job("r1", 147).await.unwrap().state, "uncertain");
-        assert!(s.claim(&other, &e.credential, 147).await.unwrap().is_none());
+        assert_eq!(s.job("r1", 422).await.unwrap().state, "uncertain");
+        assert!(s.claim(&other, &e.credential, 422).await.unwrap().is_none());
     }
+    #[tokio::test]
+    async fn fenced_ambiguous_job_can_be_reviewed_while_replacement_worker_is_live() {
+        let (s, e, old) = fixture(false).await;
+        s.enqueue("r1", &old.session_id, "test", 600, 101)
+            .await
+            .unwrap();
+        s.claim(&old, &e.credential, 102).await.unwrap().unwrap();
+
+        let mut replacement = old.clone();
+        replacement.worker = "tab-b".into();
+        replacement.epoch = s
+            .heartbeat(&replacement, &e.credential, "idle", 281)
+            .await
+            .unwrap()
+            .epoch;
+        assert_eq!(s.job("r1", 282).await.unwrap().state, "uncertain");
+
+        let reviewed = s
+            .resolve(
+                "r1",
+                "completed",
+                "User verified the final ChatGPT answer; prior worker epoch is fenced",
+                282,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reviewed.state, "completed");
+        assert!(s.review("r1").await.unwrap().is_some());
+        assert!(s.claim(&replacement, &e.credential, 283).await.is_err());
+    }
+
     #[tokio::test]
     async fn authorization_and_export_scope() {
         let (s, e, c) = fixture(false).await;
@@ -1045,6 +1296,90 @@ mod tests {
             .await
             .is_err());
     }
+    #[tokio::test]
+    async fn mcp_delivery_retries_only_unclaimed_expired_attempts_then_cancels() {
+        let (s, _, c) = fixture(false).await;
+        let prepared = s
+            .prepare_task(&c.session_id, "retry this delivery", 10, 101)
+            .await
+            .unwrap();
+        let first = s.confirm_task(&prepared.id, 103).await.unwrap();
+        assert_eq!(first.state, "queued");
+
+        // TTL has elapsed, but the configured retry delay has not.
+        s.process_retries(114).await.unwrap();
+        let status = s
+            .dispatch_task_status(&prepared.request_id, 114)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.attempt, 1);
+        assert_eq!(status.current_job_state, "expired");
+
+        // First retry after the delay.
+        s.process_retries(143).await.unwrap();
+        let status = s
+            .dispatch_task_status(&prepared.request_id, 143)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.attempt, 2);
+        assert_eq!(status.current_job_state, "queued");
+        assert_ne!(status.current_job_id, prepared.request_id);
+
+        // Second retry after another expired, never-claimed attempt.
+        s.process_retries(183).await.unwrap();
+        let status = s
+            .dispatch_task_status(&prepared.request_id, 183)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.attempt, 3);
+        assert_eq!(status.current_job_state, "queued");
+
+        // No more retries after the configured attempt budget is exhausted.
+        s.process_retries(223).await.unwrap();
+        let status = s
+            .dispatch_task_status(&prepared.request_id, 223)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, "canceled");
+        assert_eq!(status.current_job_state, "canceled");
+    }
+
+    #[tokio::test]
+    async fn mcp_delivery_never_retries_claimed_or_uncertain_attempts() {
+        let (s, e, old) = fixture(false).await;
+        let prepared = s
+            .prepare_task(&old.session_id, "do not duplicate", 10, 101)
+            .await
+            .unwrap();
+        s.confirm_task(&prepared.id, 103).await.unwrap();
+        s.claim(&old, &e.credential, 104).await.unwrap().unwrap();
+
+        // Claimed means the browser may already have clicked Send: no replay.
+        s.process_retries(114).await.unwrap();
+        let status = s
+            .dispatch_task_status(&prepared.request_id, 114)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.attempt, 1);
+        assert_eq!(status.state, "in_progress");
+
+        // Once the lease is lost, the task becomes uncertain, not retryable.
+        s.process_retries(281).await.unwrap();
+        let status = s
+            .dispatch_task_status(&prepared.request_id, 281)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.attempt, 1);
+        assert_eq!(status.state, "uncertain");
+        assert_eq!(status.current_job_state, "uncertain");
+    }
+
     #[tokio::test]
     async fn mcp_approval_cancel_expiry_and_revocation_are_safe() {
         let (s, _, c) = fixture(false).await;

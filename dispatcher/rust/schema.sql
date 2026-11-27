@@ -27,6 +27,23 @@ CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(session_id,state,created,id);
 CREATE UNIQUE INDEX IF NOT EXISTS one_inflight ON jobs(session_id)
 WHERE state IN ('claimed','submitted','uncertain');
 
+-- Durable retry orchestration for explicitly confirmed MCP tasks. Each attempt
+-- has its own immutable job ID; only expired, never-claimed attempts are retried.
+CREATE TABLE IF NOT EXISTS dispatch_tasks (
+    request_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    prompt TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    max_attempts INTEGER NOT NULL,
+    ttl_seconds INTEGER NOT NULL,
+    retry_delay_seconds INTEGER NOT NULL,
+    deadline INTEGER NOT NULL,
+    current_job_id TEXT NOT NULL,
+    next_retry_at INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('active','in_progress','completed','failed','uncertain','canceled'))
+);
+CREATE INDEX IF NOT EXISTS dispatch_tasks_due ON dispatch_tasks(state,next_retry_at);
+
 -- Operator review is distinct from a client acknowledgment.
 CREATE TABLE IF NOT EXISTS job_reviews (
     job_id TEXT PRIMARY KEY REFERENCES jobs(id),
