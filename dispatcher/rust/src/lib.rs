@@ -85,6 +85,15 @@ pub struct Job {
     pub worker: Option<String>, pub epoch: Option<i64>, pub result: String,
 }
 #[derive(Debug, Serialize, FromRow)]
+pub struct JobObservation {
+    pub id: String,
+    pub session_id: String,
+    pub state: String,
+    pub created: i64,
+    pub updated: i64,
+    pub expires: i64,
+}
+#[derive(Debug, Serialize, FromRow)]
 pub struct Review {
     pub job_id: String,
     pub outcome: String,
@@ -268,6 +277,12 @@ impl Store {
         let job = Self::job_tx(&mut tx, id).await?;
         tx.commit().await?;
         Ok(job)
+    }
+    /// Read-only projection for the separate observation scope.
+    pub async fn observe_job(&self, id: &str, time: i64) -> Result<JobObservation> {
+        validate(id, 128, "request_id")?;
+        sqlx::query_as("SELECT j.id,j.session_id,CASE WHEN j.state='queued' AND j.expires<=? THEN 'expired' WHEN j.state IN ('claimed','submitted') AND (s.enabled=0 OR s.epoch<>j.epoch OR s.lease_until<=?) THEN 'uncertain' ELSE j.state END AS state,j.created,j.updated,j.expires FROM jobs j JOIN sessions s ON s.id=j.session_id WHERE j.id=?")
+            .bind(time).bind(time).bind(id).fetch_optional(&self.pool).await?.ok_or(Error::NotFound)
     }
     pub async fn cancel(&self, id: &str, time: i64) -> Result<Job> {
         let mut tx = self.pool.begin().await?;
@@ -511,6 +526,17 @@ mod tests {
         assert!(second.sessions.iter().all(|row| row.id.as_str() > cursor.as_str()));
         assert!(second.next_after.is_none());
         assert!(s.list_page("",0,101).await.is_err());
+    }
+    #[tokio::test]
+    async fn observer_reads_only_metadata_without_updating_durable_state() {
+        let (s,_,c) = fixture(false).await;
+        s.enqueue("r1",&c.session_id,"private fixture",1,101).await.unwrap();
+        let status = s.observe_job("r1",103).await.unwrap();
+        assert_eq!(status.state,"expired");
+        assert!(!serde_json::to_string(&status).unwrap().contains("private fixture"));
+        let mut tx = s.pool.begin().await.unwrap();
+        assert_eq!(Store::job_tx(&mut tx,"r1").await.unwrap().state,"queued");
+        tx.commit().await.unwrap();
     }
     #[tokio::test]
     async fn operator_review_requires_expired_lease_and_never_requeues() {

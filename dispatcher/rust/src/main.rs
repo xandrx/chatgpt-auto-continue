@@ -1,3 +1,4 @@
+mod mcp;
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -246,8 +247,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8766").await?;
     let store = Store::open(&path).await.map_err(|_| std::io::Error::other("cannot initialize database"))?;
     let app = App { store, operator_digest:digest(&credential) };
+    let observer = match env::var("DISPATCHER_OBSERVER_TOKEN") {
+        Ok(value) if value.len() >= 32 && value.len() <= 512 && !same_digest(&digest(&value), &app.operator_digest) => Some(digest(&value)),
+        Ok(_) => return Err(std::io::Error::other("observer credential must be separate and contain 32–512 bytes").into()),
+        Err(env::VarError::NotPresent) => None,
+        Err(_) => return Err(std::io::Error::other("invalid observer credential").into()),
+    };
     drop(credential);
+    let mut routes = router(app.clone());
+    if let Some(scope) = observer { routes = routes.merge(mcp::routes(app.store.clone(), scope)); }
     tracing::info!("dispatcher development API listening on loopback");
-    axum::serve(listener, router(app)).await?;
+    axum::serve(listener, routes).await?;
     Ok(())
 }

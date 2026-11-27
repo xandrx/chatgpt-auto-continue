@@ -13,4 +13,15 @@ All 660 synthetic jobs delivered once and acknowledged. No duplicate claims obse
 
 Limitations: one run per configuration, sampled RSS rather than peak RSS, idle CPU over a one-second window, loopback rather than WAN; the 500 case is batched. These results do not establish production capacity or 500 simultaneous waits. The measured delay includes HTTP enqueue and claim; it is not the local API p95 target.
 
-Next comparison: per-session notifications and stable cursor pagination. A new CI run must confirm behavior; compare measurements cautiously because runner scheduling differs.
+## After targeted wakeups and registry pagination
+
+Linux CI run 45996668695, commit a18632ab4d7127a9be4558e615d0f66cd358fd00. Same synthetic workload; 12 Rust tests and both HTTP/schema tests passed.
+
+| Enrolled | Delivered | p50 ms | p95 ms | Idle RSS MiB | Sampled RSS MiB | Idle CPU % |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 10 | 8.93 | 10.65 | 6.40 | 7.61 | 0.00 |
+| 50 | 50 | 38.76 | 44.16 | 6.49 | 10.44 | 0.00 |
+| 100 | 100 | 78.76 | 89.08 | 6.40 | 12.51 | 0.00 |
+| 500 | 500 | 53.93 | 70.48 | 6.56 | 15.36 | 0.00 |
+
+The 100-parallel scenario p95 fell from 181.01 ms to 89.08 ms. All registered sessions were enumerated and all synthetic jobs delivered once. Compare single runs cautiously; runner scheduling differs. No production VPS benchmark yet. MCP dependency and observation interface are not included in these results.
