@@ -1017,7 +1017,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(prepared.state, "pending");
-        assert!(!prepared.session_online);
+        assert!(prepared.session_online);
+        assert_eq!(prepared.session_status, "idle");
         assert_eq!(prepared.prompt, "deploy only after approval");
         assert!(matches!(
             s.job(&prepared.request_id, 102).await,
