@@ -822,6 +822,10 @@ impl Store {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("UPDATE dispatch_tasks SET state='canceled',prompt='' WHERE current_job_id=? AND state IN ('active','in_progress')")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         let job = Self::job_tx(&mut tx, id).await?;
         tx.commit().await?;
         Ok(job)
@@ -874,6 +878,11 @@ impl Store {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("UPDATE dispatch_tasks SET state=?,prompt='' WHERE current_job_id=? AND state IN ('active','in_progress','uncertain')")
+            .bind(outcome)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("UPDATE sessions SET worker=NULL,epoch=epoch+1,lease_until=0,status='offline' WHERE id=?")
             .bind(&job.session_id).execute(&mut *tx).await?;
         let job = Self::job_tx(&mut tx, id).await?;
@@ -907,6 +916,10 @@ impl Store {
             sqlx::query("UPDATE jobs SET state='claimed',worker=?,epoch=?,updated=? WHERE id=? AND state='queued'")
                 .bind(&client.worker).bind(client.epoch).bind(time).bind(&job.id)
                 .execute(&mut *tx).await?;
+            sqlx::query("UPDATE dispatch_tasks SET state='in_progress',prompt='' WHERE current_job_id=? AND state='active'")
+                .bind(&job.id)
+                .execute(&mut *tx)
+                .await?;
             Some(Self::job_tx(&mut tx, &job.id).await?)
         } else {
             None
@@ -981,6 +994,16 @@ impl Store {
             if job.result != result {
                 return Err(Error::Conflict("ack payload conflict"));
             }
+            let task_state = if target == "submitted" {
+                "in_progress"
+            } else {
+                target
+            };
+            sqlx::query("UPDATE dispatch_tasks SET state=?,prompt='' WHERE current_job_id=? AND state IN ('active','in_progress')")
+                .bind(task_state)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await?;
             return Ok(job);
         }
@@ -995,6 +1018,16 @@ impl Store {
             .bind(target)
             .bind(result)
             .bind(time)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let task_state = if target == "submitted" {
+            "in_progress"
+        } else {
+            target
+        };
+        sqlx::query("UPDATE dispatch_tasks SET state=?,prompt='' WHERE current_job_id=? AND state IN ('active','in_progress')")
+            .bind(task_state)
             .bind(id)
             .execute(&mut *tx)
             .await?;
