@@ -34,3 +34,17 @@ CREATE TABLE IF NOT EXISTS job_reviews (
     note TEXT NOT NULL,
     reviewed_at INTEGER NOT NULL
 );
+
+-- Two-phase MCP dispatch: a prepared prompt is never queued until confirmed.
+CREATE TABLE IF NOT EXISTS mcp_approvals (
+    id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    prompt TEXT NOT NULL,
+    ttl_seconds INTEGER NOT NULL CHECK(ttl_seconds BETWEEN 1 AND 86400),
+    created INTEGER NOT NULL,
+    expires INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','queued','canceled','expired')),
+    job_id TEXT REFERENCES jobs(id)
+);
+CREATE INDEX IF NOT EXISTS mcp_approvals_expiry ON mcp_approvals(state,expires);

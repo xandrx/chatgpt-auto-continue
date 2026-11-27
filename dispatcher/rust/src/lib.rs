@@ -149,6 +149,40 @@ pub struct JobObservation {
     pub expires: i64,
 }
 #[derive(Debug, Serialize, FromRow)]
+pub struct PreparedTask {
+    pub id: String,
+    pub request_id: String,
+    pub session_id: String,
+    pub alias: String,
+    pub prompt: String,
+    pub ttl_seconds: i64,
+    pub created: i64,
+    pub expires: i64,
+    pub state: String,
+    pub job_id: Option<String>,
+    pub session_status: String,
+    pub session_online: bool,
+}
+#[derive(Debug, Serialize)]
+pub struct JobReceipt {
+    pub request_id: String,
+    pub session_id: String,
+    pub state: String,
+    pub created: i64,
+    pub expires: i64,
+}
+impl From<Job> for JobReceipt {
+    fn from(job: Job) -> Self {
+        Self {
+            request_id: job.id,
+            session_id: job.session_id,
+            state: job.state,
+            created: job.created,
+            expires: job.expires,
+        }
+    }
+}
+#[derive(Debug, Serialize, FromRow)]
 pub struct Review {
     pub job_id: String,
     pub outcome: String,
@@ -441,6 +475,128 @@ impl Store {
         validate(id, 128, "request_id")?;
         sqlx::query_as("SELECT j.id,j.session_id,CASE WHEN j.state='queued' AND j.expires<=? THEN 'expired' WHEN j.state IN ('claimed','submitted') AND (s.enabled=0 OR s.epoch<>j.epoch OR s.lease_until<=?) THEN 'uncertain' ELSE j.state END AS state,j.created,j.updated,j.expires FROM jobs j JOIN sessions s ON s.id=j.session_id WHERE j.id=?")
             .bind(time).bind(time).bind(id).fetch_optional(&self.pool).await?.ok_or(Error::NotFound)
+    }
+    /// Persist a proposed MCP task without making it visible to the worker queue.
+    /// A pending approval is short-lived and unique per session.
+    pub async fn prepare_task(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        ttl: i64,
+        time: i64,
+    ) -> Result<PreparedTask> {
+        validate(session_id, 128, "session_id")?;
+        validate(prompt, MAX_PROMPT, "prompt")?;
+        if !(1..=86_400).contains(&ttl) {
+            return Err(Error::Invalid("ttl_seconds"));
+        }
+        let id = Uuid::new_v4().to_string();
+        let request_id = Uuid::new_v4().to_string();
+        let mut tx = self.pool.begin().await?;
+        let session = Self::session(&mut tx, session_id).await?;
+        if !session.enabled {
+            return Err(Error::Conflict("session revoked"));
+        }
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mcp_approvals WHERE session_id=? AND state='pending' AND expires>?")
+            .bind(session_id).bind(time).fetch_one(&mut *tx).await?;
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM jobs WHERE session_id=? AND state='queued' AND expires>?",
+        )
+        .bind(session_id)
+        .bind(time)
+        .fetch_one(&mut *tx)
+        .await?;
+        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE session_id=? AND state IN ('claimed','submitted','uncertain')")
+            .bind(session_id).fetch_one(&mut *tx).await?;
+        if pending > 0 || queued > 0 || active > 0 {
+            return Err(Error::Conflict(
+                "session already has a pending or unresolved task",
+            ));
+        }
+        sqlx::query("UPDATE mcp_approvals SET state='expired',prompt='' WHERE state='pending' AND expires<=?")
+            .bind(time).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO mcp_approvals(id,request_id,session_id,prompt,ttl_seconds,created,expires,state) VALUES(?,?,?,?,?,?,?,'pending')")
+            .bind(&id).bind(&request_id).bind(session_id).bind(prompt).bind(ttl).bind(time).bind(time+120)
+            .execute(&mut *tx).await?;
+        let task = sqlx::query_as::<_, PreparedTask>("SELECT a.id,a.request_id,a.session_id,s.alias,a.prompt,a.ttl_seconds,a.created,a.expires,a.state,a.job_id,s.status AS session_status,(s.enabled=1 AND s.lease_until>?) AS session_online FROM mcp_approvals a JOIN sessions s ON s.id=a.session_id WHERE a.id=?")
+            .bind(time).bind(&id).fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(task)
+    }
+    /// Commit a prepared task exactly once. The approval and queue insertion
+    /// share one SQLite transaction so a lost MCP response is safely retryable.
+    pub async fn confirm_task(&self, approval_id: &str, time: i64) -> Result<JobReceipt> {
+        validate(approval_id, 64, "approval_id")?;
+        let mut tx = self.pool.begin().await?;
+        let row: Option<PreparedTask> = sqlx::query_as("SELECT a.id,a.request_id,a.session_id,s.alias,a.prompt,a.ttl_seconds,a.created,a.expires,a.state,a.job_id,s.status AS session_status,(s.enabled=1 AND s.lease_until>?) AS session_online FROM mcp_approvals a JOIN sessions s ON s.id=a.session_id WHERE a.id=?")
+            .bind(time).bind(approval_id).fetch_optional(&mut *tx).await?;
+        let row = row.ok_or(Error::NotFound)?;
+        if row.state == "queued" {
+            let job_id = row
+                .job_id
+                .as_deref()
+                .ok_or(Error::Conflict("approval receipt missing"))?;
+            let job = Self::job_tx(&mut tx, job_id).await?;
+            tx.commit().await?;
+            return Ok(job.into());
+        }
+        if row.state != "pending" {
+            return Err(Error::Conflict("approval is no longer pending"));
+        }
+        if row.expires <= time {
+            sqlx::query(
+                "UPDATE mcp_approvals SET state='expired',prompt='' WHERE id=? AND state='pending'",
+            )
+            .bind(approval_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Err(Error::Conflict("approval expired; prepare again"));
+        }
+        let session = Self::session(&mut tx, &row.session_id).await?;
+        if !session.enabled {
+            return Err(Error::Conflict("session revoked"));
+        }
+        let blocked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE session_id=? AND (state IN ('claimed','submitted','uncertain') OR (state='queued' AND expires>?))")
+            .bind(&row.session_id).bind(time).fetch_one(&mut *tx).await?;
+        if blocked > 0 {
+            return Err(Error::Conflict(
+                "session already has a pending or unresolved task",
+            ));
+        }
+        sqlx::query("INSERT INTO jobs(id,session_id,prompt,state,created,updated,expires) VALUES(?,?,?,'queued',?,?,?)")
+            .bind(&row.request_id).bind(&row.session_id).bind(&row.prompt).bind(time).bind(time).bind(time+row.ttl_seconds)
+            .execute(&mut *tx).await?;
+        sqlx::query("UPDATE mcp_approvals SET state='queued',job_id=?,prompt='' WHERE id=? AND state='pending'")
+            .bind(&row.request_id).bind(approval_id).execute(&mut *tx).await?;
+        let job = Self::job_tx(&mut tx, &row.request_id).await?;
+        tx.commit().await?;
+        self.notify_change(&row.session_id);
+        Ok(job.into())
+    }
+    pub async fn cancel_prepared_task(&self, approval_id: &str) -> Result<()> {
+        validate(approval_id, 64, "approval_id")?;
+        let mut tx = self.pool.begin().await?;
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM mcp_approvals WHERE id=?")
+                .bind(approval_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        match state.as_deref() {
+            Some("pending") => {
+                sqlx::query("UPDATE mcp_approvals SET state='canceled',prompt='' WHERE id=? AND state='pending'")
+                    .bind(approval_id).execute(&mut *tx).await?;
+            }
+            Some("canceled") | Some("expired") => {}
+            Some("queued") => {
+                return Err(Error::Conflict(
+                    "task already queued; cancel the queued job instead",
+                ))
+            }
+            _ => return Err(Error::NotFound),
+        }
+        tx.commit().await?;
+        Ok(())
     }
     pub async fn cancel(&self, id: &str, time: i64) -> Result<Job> {
         let mut tx = self.pool.begin().await?;
@@ -852,6 +1008,76 @@ mod tests {
             .all(|row| row.id.as_str() > cursor.as_str()));
         assert!(second.next_after.is_none());
         assert!(s.list_page("", 0, 101).await.is_err());
+    }
+    #[tokio::test]
+    async fn mcp_prepare_does_not_queue_until_confirm_and_confirm_is_idempotent() {
+        let (s, _, c) = fixture(false).await;
+        let prepared = s
+            .prepare_task(&c.session_id, "deploy only after approval", 600, 101)
+            .await
+            .unwrap();
+        assert_eq!(prepared.state, "pending");
+        assert!(!prepared.session_online);
+        assert_eq!(prepared.prompt, "deploy only after approval");
+        assert!(matches!(
+            s.job(&prepared.request_id, 102).await,
+            Err(Error::NotFound)
+        ));
+        assert!(s
+            .prepare_task(&c.session_id, "second task", 600, 102)
+            .await
+            .is_err());
+        let first = s.confirm_task(&prepared.id, 103).await.unwrap();
+        let retry = s.confirm_task(&prepared.id, 104).await.unwrap();
+        assert_eq!(first.request_id, prepared.request_id);
+        assert_eq!(retry.request_id, first.request_id);
+        assert_eq!(retry.created, first.created);
+        assert_eq!(retry.state, "queued");
+        assert_eq!(
+            s.job(&first.request_id, 104).await.unwrap().prompt,
+            "deploy only after approval"
+        );
+        assert!(s
+            .prepare_task(&c.session_id, "third task", 600, 105)
+            .await
+            .is_err());
+    }
+    #[tokio::test]
+    async fn mcp_approval_cancel_expiry_and_revocation_are_safe() {
+        let (s, _, c) = fixture(false).await;
+        let canceled = s
+            .prepare_task(&c.session_id, "cancel me", 600, 100)
+            .await
+            .unwrap();
+        s.cancel_prepared_task(&canceled.id).await.unwrap();
+        s.cancel_prepared_task(&canceled.id).await.unwrap();
+        assert!(s.confirm_task(&canceled.id, 101).await.is_err());
+        let stored: String = sqlx::query_scalar("SELECT prompt FROM mcp_approvals WHERE id=?")
+            .bind(&canceled.id)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert!(stored.is_empty());
+
+        let expired = s
+            .prepare_task(&c.session_id, "expire me", 600, 200)
+            .await
+            .unwrap();
+        assert!(s.confirm_task(&expired.id, 321).await.is_err());
+        let state: String = sqlx::query_scalar("SELECT state FROM mcp_approvals WHERE id=?")
+            .bind(&expired.id)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "expired");
+
+        let revoked = s
+            .prepare_task(&c.session_id, "do not send", 600, 400)
+            .await
+            .unwrap();
+        s.revoke(&c.session_id, 401).await.unwrap();
+        assert!(s.confirm_task(&revoked.id, 402).await.is_err());
+        s.cancel_prepared_task(&revoked.id).await.unwrap();
     }
     #[tokio::test]
     async fn observer_reads_only_metadata_without_updating_durable_state() {

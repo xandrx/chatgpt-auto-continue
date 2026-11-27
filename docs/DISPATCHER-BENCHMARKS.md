@@ -24,4 +24,17 @@ Linux CI run 45996668695, commit a18632ab4d7127a9be4558e615d0f66cd358fd00. Same 
 | 100 | 100 | 78.76 | 89.08 | 6.40 | 12.51 | 0.00 |
 | 500 | 500 | 53.93 | 70.48 | 6.56 | 15.36 | 0.00 |
 
-The 100-parallel scenario p95 fell from 181.01 ms to 89.08 ms. All registered sessions were enumerated and all synthetic jobs delivered once. Compare single runs cautiously; runner scheduling differs. No production VPS benchmark yet. MCP dependency and observation interface are not included in these results.
+The 100-parallel scenario p95 fell from 181.01 ms to 89.08 ms in the first targeted-wakeup run. All registered sessions were enumerated and all synthetic jobs delivered once. Compare single runs cautiously; runner scheduling differs. No production VPS benchmark yet.
+
+## MCP-enabled binary baseline
+
+Linux CI run 45998288383, commit 11640b876b08. The MCP SDK and observer module are included in the release binary. The synthetic load test is unchanged; 500 sessions still use at most 100 concurrent waits.
+
+| Enrolled | Delivered | p50 ms | p95 ms | Idle RSS MiB | Sampled RSS MiB | Idle CPU % |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 10 | 11.68 | 13.95 | 7.78 | 8.95 | 0.00 |
+| 50 | 50 | 56.52 | 73.77 | 7.80 | 12.14 | 0.00 |
+| 100 | 100 | 96.14 | 111.61 | 7.96 | 14.73 | 0.00 |
+| 500 | 500 | 79.56 | 103.59 | 7.65 | 17.09 | 0.00 |
+
+MCP smoke passed: initialization, scoped auth, origin rejection, no-store, redacted sessions, metadata-only status. The MCP-enabled process uses somewhat more RSS than the previous build; do not interpret differences between individual CI runs as a controlled benchmark. No production VPS benchmark yet.

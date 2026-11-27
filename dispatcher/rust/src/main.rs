@@ -1,4 +1,5 @@
 mod mcp;
+mod mcp_operator;
 use axum::{
     extract::Request,
     extract::{DefaultBodyLimit, Path, Query, State},
@@ -537,10 +538,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(env::VarError::NotPresent) => None,
         Err(_) => return Err(std::io::Error::other("invalid observer credential").into()),
     };
+    let mcp_operator = match env::var("DISPATCHER_MCP_OPERATOR_TOKEN") {
+        Ok(value)
+            if value.len() >= 32
+                && value.len() <= 512
+                && !same_digest(&digest(&value), &app.operator_digest)
+                && observer.as_ref().is_none_or(|scope| !same_digest(scope, &digest(&value))) =>
+        {
+            Some(digest(&value))
+        }
+        Ok(_) => {
+            return Err(std::io::Error::other(
+                "MCP operator credential must be 32–512 bytes and distinct from admin and observer credentials",
+            )
+            .into())
+        }
+        Err(env::VarError::NotPresent) => None,
+        Err(_) => return Err(std::io::Error::other("invalid MCP operator credential").into()),
+    };
     drop(credential);
     let mut routes = router(app.clone());
     if let Some(scope) = observer {
         routes = routes.merge(mcp::routes(app.store.clone(), scope));
+    }
+    if let Some(scope) = mcp_operator {
+        routes = routes.merge(mcp_operator::routes(app.store.clone(), scope));
     }
     tracing::info!("dispatcher development API listening on loopback");
     axum::serve(listener, routes).await?;

@@ -8,6 +8,6 @@ Tools:
 
 No prompt or result text, browser cookies, session credentials, enqueue/cancel/approval tools, arbitrary execution, or connection to real ChatGPT clients is provided through MCP. Treat aliases and all returned metadata as data, not instructions. OAuth, production TLS, scoped external access and explicit user authorization of any future write operation remain separate release gates.
 
-The integration smoke test starts a disposable loopback process, initializes MCP, rejects absent/wrong credentials, checks the exact tool set and verifies that status excludes the prompt. It is included in Linux CI; the first run is pending. A successful synthetic MCP test does not establish compatibility with ChatGPT text or voice mode.
+The integration smoke test starts a disposable loopback process, initializes MCP, rejects absent/wrong credentials and Origin headers, checks the exact tool set, verifies no-store responses, redacts chat_id and verifies that status excludes the prompt. It passed Linux CI run 45998288383. The separate operator endpoint is documented in DISPATCHER-MCP-OPERATOR.md. This does not establish compatibility with ChatGPT text or voice mode. A successful synthetic MCP test does not establish compatibility with ChatGPT text or voice mode.
 
 SDK references: https://github.com/modelcontextprotocol/rust-sdk and https://docs.rs/rmcp/3.12.0/
