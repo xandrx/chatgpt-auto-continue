@@ -105,6 +105,19 @@ async fn cancel(State(app): State<App>, Path(id): Path<String>, headers: HeaderM
     operator(&app, &headers)?;
     Ok(Json(json!(app.store.cancel(&id, now()).await?)))
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Resolve { outcome: String, note: String, verified: bool }
+async fn resolve(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, Json(req): Json<Resolve>) -> ApiResult<Json<Value>> {
+    operator(&app, &headers)?;
+    if !req.verified { return Err(ApiError(Error::Invalid("explicit verification required"))); }
+    let job = app.store.resolve(&id, &req.outcome, &req.note, now()).await?;
+    Ok(Json(json!({"job":job,"review":app.store.review(&id).await?})))
+}
+async fn get_review(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    operator(&app, &headers)?;
+    Ok(Json(json!({"review":app.store.review(&id).await?})))
+}
 async fn heartbeat(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, Json(req): Json<Heartbeat>) -> ApiResult<Json<Value>> {
     let client = Client { session_id:id, chat_id:req.chat_id, worker:req.worker, epoch:req.epoch };
     Ok(Json(json!(app.store.heartbeat(&client, bearer(&headers)?, &req.status, now()).await?)))
@@ -132,6 +145,7 @@ fn router(app: App) -> Router {
         .route("/v1/jobs", post(enqueue))
         .route("/v1/jobs/{id}", get(job))
         .route("/v1/jobs/{id}/cancel", post(cancel))
+        .route("/v1/jobs/{id}/review", get(get_review).post(resolve))
         .layer(DefaultBodyLimit::max(512 * 1024))
         .layer(middleware::from_fn(no_cache))
         .with_state(app)
@@ -197,6 +211,12 @@ mod tests {
         let (status, job) = call(&app,"GET","/v1/jobs/r1",Some(&operator_key),Value::Null).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(job["state"],"completed");
+        let (status, _) = call(&app,"POST","/v1/jobs/r1/review",Some(session_key),json!({"outcome":"completed","note":"fixture","verified":true})).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = call(&app,"POST","/v1/jobs/r1/review",Some(&operator_key),json!({"outcome":"completed","note":"fixture","verified":false})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(&app,"POST","/v1/jobs/r1/review",Some(&operator_key),json!({"outcome":"completed","note":"fixture","verified":true})).await;
+        assert_eq!(status, StatusCode::CONFLICT);
         let (status, empty) = call(&app,"POST",&format!("{prefix}/wait"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"wait_ms":10})).await;
         assert_eq!(status, StatusCode::OK);
         assert!(empty["job"].is_null());

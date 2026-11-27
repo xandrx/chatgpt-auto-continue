@@ -26,3 +26,11 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(session_id,state,created,id);
 CREATE UNIQUE INDEX IF NOT EXISTS one_inflight ON jobs(session_id)
 WHERE state IN ('claimed','submitted','uncertain');
+
+-- Operator review is distinct from a client acknowledgment.
+CREATE TABLE IF NOT EXISTS job_reviews (
+    job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+    outcome TEXT NOT NULL CHECK(outcome IN ('completed','failed')),
+    note TEXT NOT NULL,
+    reviewed_at INTEGER NOT NULL
+);

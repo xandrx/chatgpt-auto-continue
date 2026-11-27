@@ -16,7 +16,7 @@ queued -> claimed -> submitted -> completed
 queued -> canceled or expired
 claimed -> failed (known not submitted) or uncertain
 submitted -> uncertain
-uncertain blocks future claims; explicit operator review is required. A recovery action is not yet exposed. Only queued jobs have TTL expiry. Results are optional and accepted only for completed jobs with export enabled. A completion report is a client assertion, not proof of external execution.
+uncertain blocks future claims. POST /v1/jobs/{id}/review is operator-only and accepts outcome (completed or failed), note, verified=true. Stop the old worker, inspect the real conversation, and wait for lease expiration before review. A review records an operator assertion separately from client acknowledgments and never requeues the original task. GET /v1/jobs/{id}/review returns the audit record. Identical review retries are idempotent; conflicting reviews are rejected. Only queued jobs have TTL expiry. Results are optional and accepted only for completed jobs with export enabled. A completion report is a client assertion, not proof of external execution.
 
 ## Test scope
 Use synthetic sessions and harmless fixture tasks. Do not connect live browser tabs or expose the service until the release gates in DISPATCHER-PLAN.md are satisfied. Browser timing, lease loss while a real DOM operation is pending, and end-to-end delivery remain untested.

@@ -79,6 +79,13 @@ pub struct Job {
     pub created: i64, pub updated: i64, pub expires: i64,
     pub worker: Option<String>, pub epoch: Option<i64>, pub result: String,
 }
+#[derive(Debug, Serialize, FromRow)]
+pub struct Review {
+    pub job_id: String,
+    pub outcome: String,
+    pub note: String,
+    pub reviewed_at: i64,
+}
 #[derive(Debug, Clone)]
 pub struct Client {
     pub session_id: String, pub chat_id: String, pub worker: String, pub epoch: i64,
@@ -239,6 +246,46 @@ impl Store {
         let job = Self::job_tx(&mut tx, id).await?;
         tx.commit().await?;
         Ok(job)
+    }
+    /// Resolve ambiguity only after the old lease expires and the operator
+    /// explicitly verifies the outcome. This never requeues the original job.
+    pub async fn resolve(&self, id: &str, outcome: &str, note: &str, time: i64) -> Result<Job> {
+        validate(note, 2000, "review note")?;
+        if !matches!(outcome, "completed" | "failed") {
+            return Err(Error::Invalid("review outcome"));
+        }
+        let mut tx = self.pool.begin().await?;
+        let job = Self::job_tx(&mut tx, id).await?;
+        let prior: Option<(String,String)> = sqlx::query_as("SELECT outcome,note FROM job_reviews WHERE job_id=?")
+            .bind(id).fetch_optional(&mut *tx).await?;
+        if let Some((old_outcome,old_note)) = prior {
+            if old_outcome != outcome || old_note != note {
+                return Err(Error::Conflict("review already recorded"));
+            }
+            tx.commit().await?;
+            return Ok(job);
+        }
+        let session = Self::session(&mut tx, &job.session_id).await?;
+        if session.lease_until > time {
+            return Err(Error::Conflict("stop the worker and wait for lease expiration before review"));
+        }
+        if !matches!(job.state.as_str(), "uncertain" | "claimed" | "submitted") {
+            return Err(Error::Conflict("only ambiguous jobs can be reviewed"));
+        }
+        sqlx::query("INSERT INTO job_reviews(job_id,outcome,note,reviewed_at) VALUES(?,?,?,?)")
+            .bind(id).bind(outcome).bind(note).bind(time).execute(&mut *tx).await?;
+        sqlx::query("UPDATE jobs SET state=?,updated=? WHERE id=?")
+            .bind(outcome).bind(time).bind(id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE sessions SET worker=NULL,epoch=epoch+1,lease_until=0,status='offline' WHERE id=?")
+            .bind(&job.session_id).execute(&mut *tx).await?;
+        let job = Self::job_tx(&mut tx, id).await?;
+        tx.commit().await?;
+        self.notify_change();
+        Ok(job)
+    }
+    pub async fn review(&self, id: &str) -> Result<Option<Review>> {
+        Ok(sqlx::query_as("SELECT job_id,outcome,note,reviewed_at FROM job_reviews WHERE job_id=?")
+            .bind(id).fetch_optional(&self.pool).await?)
     }
     pub async fn claim(&self, client: &Client, credential: &str, time: i64) -> Result<Option<Job>> {
         let mut tx = self.pool.begin().await?;
@@ -401,6 +448,24 @@ mod tests {
         };
         let (job, ()) = tokio::join!(s.claim_wait(&c,&e.credential,1000),idle);
         assert_eq!(job.unwrap().unwrap().id,"r1");
+    }
+    #[tokio::test]
+    async fn operator_review_requires_expired_lease_and_never_requeues() {
+        let (s,e,mut c) = fixture(false).await;
+        s.enqueue("r1",&c.session_id,"test",600,101).await.unwrap();
+        s.enqueue("r2",&c.session_id,"next",600,102).await.unwrap();
+        s.claim(&c,&e.credential,103).await.unwrap().unwrap();
+        assert!(s.resolve("r1","failed","verified",104).await.is_err());
+        assert!(s.resolve("r1","queued","verified",146).await.is_err());
+        assert!(s.resolve("r1","failed","",146).await.is_err());
+        assert_eq!(s.resolve("r1","failed","verified not submitted",146).await.unwrap().state,"failed");
+        let review = s.review("r1").await.unwrap().unwrap();
+        assert_eq!(review.reviewed_at,146);
+        assert_eq!(s.resolve("r1","failed","verified not submitted",147).await.unwrap().updated,146);
+        assert!(s.resolve("r1","completed","different",148).await.is_err());
+        assert!(s.ack(&c,&e.credential,"r1","submitted","",148).await.is_err());
+        c.epoch = s.heartbeat(&c,&e.credential,"idle",149).await.unwrap().epoch;
+        assert_eq!(s.claim(&c,&e.credential,150).await.unwrap().unwrap().id,"r2");
     }
     #[tokio::test]
     async fn disk_restart_preserves_queue_and_invalidates_lease() {

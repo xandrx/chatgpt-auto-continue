@@ -24,3 +24,4 @@ jobs:
       - run: cargo build --release --locked
       - run: python3 tests/schema_smoke.py
       - run: python3 tests/http_smoke.py target/release/chatgpt-session-dispatcher
+      - run: python3 tests/load_smoke.py target/release/chatgpt-session-dispatcher
