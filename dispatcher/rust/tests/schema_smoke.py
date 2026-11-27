@@ -28,4 +28,7 @@ db.execute("INSERT INTO mcp_approvals(id,request_id,session_id,prompt,ttl_second
 reject("INSERT INTO mcp_approvals(id,request_id,session_id,prompt,ttl_seconds,created,expires,state) VALUES('approval2','request','s','fixture',60,1,121,'pending')")
 reject("INSERT INTO mcp_approvals(id,request_id,session_id,prompt,ttl_seconds,created,expires,state) VALUES('approval3','request3','s','fixture',0,1,121,'pending')")
 reject("INSERT INTO mcp_approvals(id,request_id,session_id,prompt,ttl_seconds,created,expires,state) VALUES('approval4','request4','missing','fixture',60,1,121,'pending')")
-print("SQLite schema: 11 checks passed (unique chat, FK, state, in-flight lock, uncertainty lock, release, export default, approval FK, approval ID, approval TTL, unique request)")
+db.execute("INSERT INTO dispatch_tasks(request_id,session_id,prompt,attempt,max_attempts,ttl_seconds,retry_delay_seconds,deadline,current_job_id,next_retry_at,state) VALUES('b','s','fixture',1,3,60,30,600,'b',91,'active')")
+reject("INSERT INTO dispatch_tasks(request_id,session_id,prompt,attempt,max_attempts,ttl_seconds,retry_delay_seconds,deadline,current_job_id,next_retry_at,state) VALUES('orphan-task','s','fixture',1,3,60,30,600,'b',91,'active')")
+reject("UPDATE dispatch_tasks SET state='invalid' WHERE request_id='b'")
+print("SQLite schema: 14 checks passed (session/job FKs, retry task ID/state, unique chat, job states, in-flight and uncertainty locks, release, export default, approval constraints)")

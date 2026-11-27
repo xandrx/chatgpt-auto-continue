@@ -1453,39 +1453,39 @@ mod tests {
             .unwrap();
         s.claim(&c, &e.credential, 103).await.unwrap().unwrap();
         assert!(s.resolve("r1", "failed", "verified", 104).await.is_err());
-        assert!(s.resolve("r1", "queued", "verified", 146).await.is_err());
-        assert!(s.resolve("r1", "failed", "", 146).await.is_err());
+        assert!(s.resolve("r1", "queued", "verified", 281).await.is_err());
+        assert!(s.resolve("r1", "failed", "", 281).await.is_err());
         assert_eq!(
-            s.resolve("r1", "failed", "verified not submitted", 146)
+            s.resolve("r1", "failed", "verified not submitted", 281)
                 .await
                 .unwrap()
                 .state,
             "failed"
         );
         let review = s.review("r1").await.unwrap().unwrap();
-        assert_eq!(review.reviewed_at, 146);
+        assert_eq!(review.reviewed_at, 281);
         assert_eq!(
-            s.resolve("r1", "failed", "verified not submitted", 147)
+            s.resolve("r1", "failed", "verified not submitted", 282)
                 .await
                 .unwrap()
                 .updated,
-            146
+            281
         );
         assert!(s
-            .resolve("r1", "completed", "different", 148)
+            .resolve("r1", "completed", "different", 283)
             .await
             .is_err());
         assert!(s
-            .ack(&c, &e.credential, "r1", "submitted", "", 148)
+            .ack(&c, &e.credential, "r1", "submitted", "", 283)
             .await
             .is_err());
         c.epoch = s
-            .heartbeat(&c, &e.credential, "idle", 149)
+            .heartbeat(&c, &e.credential, "idle", 284)
             .await
             .unwrap()
             .epoch;
         assert_eq!(
-            s.claim(&c, &e.credential, 150).await.unwrap().unwrap().id,
+            s.claim(&c, &e.credential, 285).await.unwrap().unwrap().id,
             "r2"
         );
     }

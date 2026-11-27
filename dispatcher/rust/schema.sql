@@ -30,7 +30,7 @@ WHERE state IN ('claimed','submitted','uncertain');
 -- Durable retry orchestration for explicitly confirmed MCP tasks. Each attempt
 -- has its own immutable job ID; only expired, never-claimed attempts are retried.
 CREATE TABLE IF NOT EXISTS dispatch_tasks (
-    request_id TEXT PRIMARY KEY,
+    request_id TEXT PRIMARY KEY REFERENCES jobs(id),
     session_id TEXT NOT NULL REFERENCES sessions(id),
     prompt TEXT NOT NULL,
     attempt INTEGER NOT NULL DEFAULT 1,
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS dispatch_tasks (
     ttl_seconds INTEGER NOT NULL,
     retry_delay_seconds INTEGER NOT NULL,
     deadline INTEGER NOT NULL,
-    current_job_id TEXT NOT NULL,
+    current_job_id TEXT NOT NULL REFERENCES jobs(id),
     next_retry_at INTEGER NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('active','in_progress','completed','failed','uncertain','canceled'))
 );
