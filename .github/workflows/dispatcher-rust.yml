@@ -4,10 +4,12 @@ on:
   pull_request:
     paths:
       - 'dispatcher/rust/**'
+      - 'dispatcher/extension/**'
       - '.github/workflows/dispatcher-rust.yml'
   push:
     paths:
       - 'dispatcher/rust/**'
+      - 'dispatcher/extension/**'
       - '.github/workflows/dispatcher-rust.yml'
 permissions:
   contents: read
@@ -26,3 +28,10 @@ jobs:
       - run: python3 tests/http_smoke.py target/release/chatgpt-session-dispatcher
       - run: python3 tests/load_smoke.py target/release/chatgpt-session-dispatcher
       - run: python3 tests/mcp_smoke.py target/release/chatgpt-session-dispatcher
+      - name: Check MV3 extension syntax
+        working-directory: .
+        run: |
+          node --check dispatcher/extension/background.js
+          node --check dispatcher/extension/content.js
+          node --check dispatcher/extension/popup.js
+          python3 -c "import json,pathlib; json.loads(pathlib.Path('dispatcher/extension/manifest.json').read_text())"

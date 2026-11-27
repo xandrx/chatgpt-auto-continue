@@ -19,6 +19,7 @@ struct App {
     store: Store,
     operator_digest: String,
     enroll_digest: Option<String>,
+    extension_origin: Option<String>,
 }
 
 struct ApiError(Error);
@@ -53,6 +54,29 @@ fn bearer(headers: &HeaderMap) -> ApiResult<&str> {
         .filter(|v| !v.is_empty() && v.len() <= 512)
         .ok_or(ApiError(Error::Unauthorized))
 }
+fn session_auth(headers: &HeaderMap, session_id: &str) -> ApiResult<String> {
+    if let Some(value) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|v| !v.is_empty() && v.len() <= 512)
+    {
+        return Ok(value.to_owned());
+    }
+    let cookie_name = format!("csd_session_{session_id}");
+    headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|part| {
+                let (name, value) = part.trim().split_once('=')?;
+                (name == cookie_name).then_some(value)
+            })
+        })
+        .filter(|v| !v.is_empty() && v.len() <= 512)
+        .map(str::to_owned)
+        .ok_or(ApiError(Error::Unauthorized))
+}
 fn operator(app: &App, headers: &HeaderMap) -> ApiResult<()> {
     if !same_digest(&app.operator_digest, &digest(bearer(headers)?)) {
         return Err(ApiError(Error::Unauthorized));
@@ -64,6 +88,63 @@ async fn no_cache(request: Request, next: Next) -> Response {
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+async fn extension_cors(
+    State(allowed_origin): State<Option<String>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    let allowed = allowed_origin
+        .as_deref()
+        .is_some_and(|expected| Some(expected) == origin);
+    if request.method().as_str() == "OPTIONS" {
+        if !allowed {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        let headers = response.headers_mut();
+        headers.insert(
+            "access-control-allow-origin",
+            HeaderValue::from_str(origin.unwrap()).unwrap(),
+        );
+        headers.insert(
+            "access-control-allow-credentials",
+            HeaderValue::from_static("true"),
+        );
+        headers.insert(
+            "access-control-allow-methods",
+            HeaderValue::from_static("GET, POST, OPTIONS"),
+        );
+        headers.insert(
+            "access-control-allow-headers",
+            HeaderValue::from_static("content-type, authorization"),
+        );
+        headers.insert("access-control-max-age", HeaderValue::from_static("600"));
+        headers.insert(
+            "access-control-allow-private-network",
+            HeaderValue::from_static("true"),
+        );
+        headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+        return response;
+    }
+    let mut response = next.run(request).await;
+    if allowed {
+        let headers = response.headers_mut();
+        headers.insert(
+            "access-control-allow-origin",
+            HeaderValue::from_str(origin.unwrap()).unwrap(),
+        );
+        headers.insert(
+            "access-control-allow-credentials",
+            HeaderValue::from_static("true"),
+        );
+        headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+    }
     response
 }
 #[derive(Deserialize)]
@@ -146,19 +227,35 @@ async fn client_enroll(
     State(app): State<App>,
     headers: HeaderMap,
     Json(req): Json<Enroll>,
-) -> ApiResult<Json<Value>> {
-    let expected = app
-        .enroll_digest
-        .as_deref()
-        .ok_or(ApiError(Error::Unauthorized))?;
-    if !same_digest(expected, &digest(bearer(&headers)?)) {
+) -> ApiResult<Response> {
+    let token_authorized = match (app.enroll_digest.as_deref(), bearer(&headers)) {
+        (Some(expected), Ok(value)) => same_digest(expected, &digest(value)),
+        _ => false,
+    };
+    let origin_authorized = app.extension_origin.as_deref().is_some_and(|expected| {
+        headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            == Some(expected)
+    });
+    if !token_authorized && !origin_authorized {
         return Err(ApiError(Error::Unauthorized));
     }
     let enrolled = app
         .store
         .enroll(&req.chat_id, &req.alias, req.export_allowed, now())
         .await?;
-    Ok(Json(json!(enrolled)))
+    let session_id = enrolled.session.id.clone();
+    let cookie_name = format!("csd_session_{session_id}");
+    let cookie = format!(
+        "{cookie_name}={}; Path=/v1/sessions/{session_id}; HttpOnly; Secure; SameSite=None; Max-Age=31536000",
+        enrolled.credential
+    );
+    let mut response = Json(json!({"session":enrolled.session})).into_response();
+    let value = HeaderValue::from_bytes(cookie.as_bytes())
+        .map_err(|_| ApiError(Error::Invalid("session cookie")))?;
+    response.headers_mut().append(header::SET_COOKIE, value);
+    Ok(response)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -261,6 +358,7 @@ async fn heartbeat(
     headers: HeaderMap,
     Json(req): Json<Heartbeat>,
 ) -> ApiResult<Json<Value>> {
+    let session_key = session_auth(&headers, &id)?;
     let client = Client {
         session_id: id,
         chat_id: req.chat_id,
@@ -269,7 +367,7 @@ async fn heartbeat(
     };
     Ok(Json(json!(
         app.store
-            .heartbeat(&client, bearer(&headers)?, &req.status, now())
+            .heartbeat(&client, &session_key, &req.status, now())
             .await?
     )))
 }
@@ -279,8 +377,9 @@ async fn claim(
     headers: HeaderMap,
     Json(req): Json<ClientRequest>,
 ) -> ApiResult<Json<Value>> {
+    let session_key = session_auth(&headers, &id)?;
     Ok(Json(
-        json!({"job":app.store.claim(&req.client(id), bearer(&headers)?, now()).await?}),
+        json!({"job":app.store.claim(&req.client(id), &session_key, now()).await?}),
     ))
 }
 async fn wait(
@@ -289,6 +388,7 @@ async fn wait(
     headers: HeaderMap,
     Json(req): Json<WaitRequest>,
 ) -> ApiResult<Json<Value>> {
+    let session_key = session_auth(&headers, &id)?;
     let client = Client {
         session_id: id,
         chat_id: req.chat_id,
@@ -296,7 +396,7 @@ async fn wait(
         epoch: req.epoch,
     };
     Ok(Json(
-        json!({"job":app.store.claim_wait(&client, bearer(&headers)?, req.wait_ms).await?}),
+        json!({"job":app.store.claim_wait(&client, &session_key, req.wait_ms).await?}),
     ))
 }
 async fn ack(
@@ -305,6 +405,7 @@ async fn ack(
     headers: HeaderMap,
     Json(req): Json<Ack>,
 ) -> ApiResult<Json<Value>> {
+    let session_key = session_auth(&headers, &id)?;
     let client = Client {
         session_id: id,
         chat_id: req.chat_id,
@@ -315,7 +416,7 @@ async fn ack(
         app.store
             .ack(
                 &client,
-                bearer(&headers)?,
+                &session_key,
                 &req.request_id,
                 &req.state,
                 &req.result,
@@ -325,6 +426,7 @@ async fn ack(
     )))
 }
 fn router(app: App) -> Router {
+    let extension_origin = app.extension_origin.clone();
     Router::new()
         .route("/health", get(health))
         .route("/v1/sessions", get(list).post(enroll))
@@ -339,6 +441,10 @@ fn router(app: App) -> Router {
         .route("/v1/jobs/{id}/cancel", post(cancel))
         .route("/v1/jobs/{id}/review", get(get_review).post(resolve))
         .layer(DefaultBodyLimit::max(512 * 1024))
+        .layer(middleware::from_fn_with_state(
+            extension_origin,
+            extension_cors,
+        ))
         .layer(middleware::from_fn(no_cache))
         .with_state(app)
 }
@@ -380,8 +486,20 @@ mod tests {
         let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         (status, value)
     }
+    #[test]
+    fn session_cookie_is_scoped_to_its_session_path() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("csd_session_alpha=key-a; csd_session_beta=key-b"),
+        );
+        assert_eq!(session_auth(&headers, "alpha").unwrap(), "key-a");
+        assert_eq!(session_auth(&headers, "beta").unwrap(), "key-b");
+        assert!(session_auth(&headers, "gamma").is_err());
+    }
+
     #[tokio::test]
-    async fn client_enrollment_uses_a_separate_scoped_credential() {
+    async fn client_enrollment_returns_session_metadata_not_a_bearer_key() {
         let directory =
             std::env::temp_dir().join(format!("csd-enroll-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -394,6 +512,7 @@ mod tests {
             store,
             operator_digest: digest(&admin),
             enroll_digest: Some(digest(&enrollment)),
+            extension_origin: None,
         });
         let payload = json!({"chat_id":"client-chat","alias":"Client tab"});
         let (status, _) = call(&app, "POST", "/v1/client/enroll", None, payload.clone()).await;
@@ -416,18 +535,8 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        let session_key = enrolled["credential"].as_str().unwrap();
-        let (status, _) = call(&app, "GET", "/v1/sessions", Some(session_key), Value::Null).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let (status, _) = call(
-            &app,
-            "POST",
-            "/v1/client/enroll",
-            Some(session_key),
-            payload,
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(enrolled["session"]["id"].is_string());
+        assert!(enrolled.get("credential").is_none());
         drop(app);
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -443,6 +552,7 @@ mod tests {
             store,
             operator_digest: digest(&operator_key),
             enroll_digest: None,
+            extension_origin: None,
         });
         let (status, _) = call(&app, "GET", "/health", None, Value::Null).await;
         assert_eq!(status, StatusCode::OK);
@@ -607,10 +717,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(env::VarError::NotPresent) => None,
         Err(_) => return Err(std::io::Error::other("invalid enrollment credential").into()),
     };
+    let extension_origin = match env::var("DISPATCHER_EXTENSION_ORIGIN") {
+        Ok(value) => {
+            let id = value.strip_prefix("chrome-extension://").unwrap_or("");
+            if id.len() != 32 || !id.bytes().all(|byte| (b'a'..=b'p').contains(&byte)) {
+                return Err(std::io::Error::other(
+                    "DISPATCHER_EXTENSION_ORIGIN must be chrome-extension:// followed by a 32-character extension ID",
+                ).into());
+            }
+            Some(value)
+        }
+        Err(env::VarError::NotPresent) => None,
+        Err(_) => return Err(std::io::Error::other("invalid extension origin").into()),
+    };
     let app = App {
         store,
         operator_digest: digest(&credential),
         enroll_digest,
+        extension_origin,
     };
     let observer = match env::var("DISPATCHER_OBSERVER_TOKEN") {
         Ok(value)

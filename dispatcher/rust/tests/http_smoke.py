@@ -15,10 +15,13 @@ BASE = "http://127.0.0.1:8766"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def request(method, path, credential=None, payload=None, expected=200):
+def request(method, path, credential=None, payload=None, expected=200,
+            extra_headers=None, return_headers=False):
     headers = {}
     if credential:
         headers["Authorization"] = "Bearer " + credential
+    if extra_headers:
+        headers.update(extra_headers)
     data = None
     if payload is not None:
         data = json.dumps(payload).encode()
@@ -31,15 +34,20 @@ def request(method, path, credential=None, payload=None, expected=200):
     with response:
         assert response.status == expected, (method, path, response.status, expected)
         assert response.headers.get("Cache-Control") == "no-store"
-        return json.load(response)
+        if response.status == 204:
+            return response.headers if return_headers else None
+        data = json.load(response)
+        return (data, response.headers) if return_headers else data
 
 
 def run(binary):
     admin = secrets.token_urlsafe(32)
     enrollment = secrets.token_urlsafe(32)
     with tempfile.TemporaryDirectory() as tmp:
+        extension_origin = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         env = dict(os.environ, DISPATCHER_ADMIN_TOKEN=admin,
                    DISPATCHER_ENROLL_TOKEN=enrollment,
+                   DISPATCHER_EXTENSION_ORIGIN=extension_origin,
                    DISPATCHER_DB=str(Path(tmp) / "smoke.sqlite3"))
         proc = subprocess.Popen([str(binary)], env=env,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -53,14 +61,44 @@ def run(binary):
                 except urllib.error.URLError:
                     assert time.monotonic() < deadline, "startup timeout"
                     time.sleep(0.1)
-            client_enrolled = request("POST", "/v1/client/enroll", enrollment,
-                                      {"chat_id": "client-synthetic-chat", "alias": "client fixture"})
-            assert request("POST", "/v1/client/enroll", admin,
-                           {"chat_id": "wrong-admin", "alias": "wrong"}, expected=401)["error"] == "unauthorized"
-            assert request("GET", "/v1/sessions", client_enrolled["credential"],
+            client_enrolled, client_headers = request(
+                "POST", "/v1/client/enroll", enrollment,
+                {"chat_id": "client-synthetic-chat", "alias": "client fixture"},
+                return_headers=True)
+            client_sid = client_enrolled["session"]["id"]
+            assert "credential" not in client_enrolled
+            set_cookie = client_headers.get("Set-Cookie", "")
+            assert "HttpOnly" in set_cookie and "Secure" in set_cookie and "SameSite=None" in set_cookie
+            assert "/v1/sessions/" + client_sid in set_cookie
+            client_cookie = set_cookie.split(";", 1)[0]
+            client_lease = request(
+                "POST", "/v1/sessions/" + client_sid + "/heartbeat",
+                payload={"chat_id": "client-synthetic-chat", "worker": "client-fixture",
+                         "epoch": 0, "status": "idle"},
+                extra_headers={"Cookie": client_cookie})
+            assert client_lease["epoch"] == 1
+            assert request("GET", "/v1/sessions", extra_headers={"Cookie": client_cookie},
                            expected=401)["error"] == "unauthorized"
-            assert request("POST", "/v1/client/enroll", client_enrolled["credential"],
-                           {"chat_id": "wrong-session", "alias": "wrong"}, expected=401)["error"] == "unauthorized"
+            assert request("POST", "/v1/client/enroll", payload={"chat_id": "wrong", "alias": "wrong"},
+                           extra_headers={"Cookie": client_cookie}, expected=401)["error"] == "unauthorized"
+
+            preflight = request(
+                "OPTIONS", "/v1/client/enroll", expected=204, return_headers=True,
+                extra_headers={"Origin": extension_origin, "Access-Control-Request-Method": "POST",
+                               "Access-Control-Request-Headers": "content-type",
+                               "Access-Control-Request-Private-Network": "true"})
+            assert preflight.get("Access-Control-Allow-Origin") == extension_origin
+            assert preflight.get("Access-Control-Allow-Credentials") == "true"
+            assert preflight.get("Access-Control-Allow-Private-Network") == "true"
+            origin_enrolled, origin_headers = request(
+                "POST", "/v1/client/enroll", payload={"chat_id": "extension-synthetic-chat", "alias": "extension fixture"},
+                extra_headers={"Origin": extension_origin}, return_headers=True)
+            assert origin_headers.get("Access-Control-Allow-Origin") == extension_origin
+            assert "Set-Cookie" in origin_headers
+            assert request(
+                "POST", "/v1/client/enroll", payload={"chat_id": "wrong-origin", "alias": "wrong"},
+                extra_headers={"Origin": "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+                expected=401)["error"] == "unauthorized"
             session = request("POST", "/v1/sessions", admin,
                               {"chat_id": "synthetic-chat", "alias": "fixture"})
             sid = session["session"]["id"]

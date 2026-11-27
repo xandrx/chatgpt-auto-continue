@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Session Dispatcher</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;width:360px;padding:16px;background:#0f172a;color:#e2e8f0;font:13px system-ui,sans-serif}
+    h1{font-size:16px;margin:0 0 12px}
+    p{margin:8px 0;color:#94a3b8;line-height:1.45}
+    .origin{display:flex;gap:6px;align-items:center;padding:8px;border:1px solid #334155;border-radius:8px;background:#111c30}
+    code{font-size:11px;overflow-wrap:anywhere;flex:1;color:#bfdbfe}
+    button{border:1px solid #475569;border-radius:8px;padding:8px 10px;background:#1e293b;color:#fff;font:inherit;cursor:pointer}
+    button.primary{background:#2563eb;border-color:#2563eb}
+    button:disabled{opacity:.45;cursor:not-allowed}
+    .row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:12px 0}
+    .chat{padding:10px;border:1px solid #334155;border-radius:8px;background:#111c30}
+    .chat strong{display:block;margin-bottom:4px}
+    .check{display:flex;align-items:center;gap:8px;color:#cbd5e1}
+    .status{min-height:20px;margin-top:10px;color:#fbbf24;overflow-wrap:anywhere}
+    .muted{font-size:11px;color:#94a3b8}
+    .actions{display:flex;gap:8px;align-items:center}
+    .divider{border:0;border-top:1px solid #334155;margin:14px 0}
+  </style>
+</head>
+<body>
+  <h1>ChatGPT Session Dispatcher</h1>
+  <p>Install the local Rust dispatcher and set its extension origin before registering chats.</p>
+  <div class="origin">
+    <code id="origin"></code>
+    <button id="copy" type="button">Copy</button>
+  </div>
+  <p class="muted">Set this exact value as DISPATCHER_EXTENSION_ORIGIN, then restart the local server.</p>
+  <hr class="divider">
+  <div class="chat">
+    <strong id="chatTitle">Checking active ChatGPT tab…</strong>
+    <span class="muted" id="chatId"></span>
+  </div>
+  <div class="row">
+    <label class="check"><input id="exportAllowed" type="checkbox"> Export final answers</label>
+  </div>
+  <div class="actions">
+    <button class="primary" id="register" type="button" disabled>Register this chat</button>
+    <button id="refresh" type="button">Refresh</button>
+  </div>
+  <hr class="divider">
+  <div class="row">
+    <label class="check"><input id="remoteEnabled" type="checkbox" disabled> Accept remote tasks</label>
+    <span class="muted" id="registrationState">Not registered</span>
+  </div>
+  <p class="muted">Remote tasks are submitted only when this conversation is idle and its composer is empty. Keep the ChatGPT tab open.</p>
+  <div class="status" id="status" role="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>
