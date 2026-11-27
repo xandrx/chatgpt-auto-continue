@@ -39,7 +39,7 @@ The database path is set by systemd to `/var/lib/csd/dispatcher.sqlite3`.
 - Public `/`, `/health`, `/mcp`, `/v1/jobs`, `/v1/sessions`, and session revoke paths return 404.
 - Public enrollment without a configured extension Origin returns 401; CORS preflight for an unconfigured Origin returns 403.
 - A session worker request without its cookie returns 401; HTTP POST enrollment redirects to HTTPS.
-- Nginx configuration test passes; the Let's Encrypt renewal cron job is present.
+- Nginx configuration test passes; the Let's Encrypt renewal cron job is present. Vesta's ACME polling parser was corrected to read the JSON `status` field independent of field order; the reproducible one-line patch is `vesta-acme-status-parser.patch`, and the original script is backed up as `/usr/local/vesta/bin/v-add-letsencrypt-domain.orig-20261127`.
 - No ChatGPT session has been enrolled and remote task delivery has not been enabled.
 
 ## Operational checks

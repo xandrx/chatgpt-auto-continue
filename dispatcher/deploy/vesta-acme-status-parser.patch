@@ -1,0 +1,5 @@
+--- a/usr/local/vesta/bin/v-add-letsencrypt-domain
++++ b/usr/local/vesta/bin/v-add-letsencrypt-domain
+@@ -286,1 +286,1 @@
+-        validation=$(echo "$answer"|grep -A1 $proto |tail -n1|cut -f4 -d \")
++        validation=$(echo "$answer" | grep -Eo '"status"[[:space:]]*:[[:space:]]*"[^"]+"' | cut -d '"' -f4 | tail -n1)
