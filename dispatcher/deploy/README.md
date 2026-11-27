@@ -1,6 +1,6 @@
 # VPS deployment — Rust Session Dispatcher
 
-Deployment status (2026-11-27): **backend running** on the existing Debian 10 VPS as an enabled `chatgpt-session-dispatcher.service`, bound only to `127.0.0.1:8766`. The public HTTPS origin is `https://csd.guddom.com`; its Let's Encrypt certificate is installed and the Vesta renewal job is present. No Docker container is added. The exact unpacked-extension Origin `chrome-extension://jnhhekmehnkcciglenfdeacocibbocbe` is configured; the service was restarted and the allowed public CORS preflight was verified. No ChatGPT conversation has been enrolled yet.
+Deployment status (2026-11-27): **backend running** on the existing Debian 10 VPS as an enabled `chatgpt-session-dispatcher.service`, bound only to `127.0.0.1:8766`. The public HTTPS origin is `https://csd.guddom.com`; its Let's Encrypt certificate is installed and the Vesta renewal job is present. No Docker container is added. The exact unpacked-extension Origin `chrome-extension://jnhhekmehnkcciglenfdeacocibbocbe` is configured; the service was restarted and the allowed public CORS preflight was verified. One pilot conversation is enrolled, online and idle, with remote tasks and final-answer export enabled; no prompt has been sent.
 
 ## Security boundary
 
@@ -41,7 +41,7 @@ The database path is set by systemd to `/var/lib/csd/dispatcher.sqlite3`.
 - The service was restarted after setting `DISPATCHER_EXTENSION_ORIGIN`; `/health` and the loopback listener were verified afterward.
 - A session worker request without its cookie returns 401; HTTP POST enrollment redirects to HTTPS.
 - Nginx configuration test passes; the Let's Encrypt renewal cron job is present. Vesta's ACME polling parser was corrected to read the JSON `status` field independent of field order; the reproducible one-line patch is `vesta-acme-status-parser.patch`, and the original script is backed up as `/usr/local/vesta/bin/v-add-letsencrypt-domain.orig-20261127`.
-- No ChatGPT session has been enrolled and remote task delivery has not been enabled.
+- One user-selected pilot session is enrolled and online; remote task delivery and final-answer export are enabled for that session. No task has been submitted yet.
 
 ## Operational checks
 
