@@ -98,10 +98,11 @@ async fn extension_cors(
     let origin = request
         .headers()
         .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok());
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let allowed = allowed_origin
         .as_deref()
-        .is_some_and(|expected| Some(expected) == origin);
+        .is_some_and(|expected| Some(expected) == origin.as_deref());
     if request.method().as_str() == "OPTIONS" {
         if !allowed {
             return StatusCode::FORBIDDEN.into_response();
@@ -110,7 +111,7 @@ async fn extension_cors(
         let headers = response.headers_mut();
         headers.insert(
             "access-control-allow-origin",
-            HeaderValue::from_str(origin.unwrap()).unwrap(),
+            HeaderValue::from_str(origin.as_deref().unwrap()).unwrap(),
         );
         headers.insert(
             "access-control-allow-credentials",
@@ -137,7 +138,7 @@ async fn extension_cors(
         let headers = response.headers_mut();
         headers.insert(
             "access-control-allow-origin",
-            HeaderValue::from_str(origin.unwrap()).unwrap(),
+            HeaderValue::from_str(origin.as_deref().unwrap()).unwrap(),
         );
         headers.insert(
             "access-control-allow-credentials",
@@ -493,8 +494,14 @@ mod tests {
             header::COOKIE,
             HeaderValue::from_static("csd_session_alpha=key-a; csd_session_beta=key-b"),
         );
-        assert_eq!(session_auth(&headers, "alpha").unwrap(), "key-a");
-        assert_eq!(session_auth(&headers, "beta").unwrap(), "key-b");
+        assert_eq!(
+            session_auth(&headers, "alpha").ok().as_deref(),
+            Some("key-a")
+        );
+        assert_eq!(
+            session_auth(&headers, "beta").ok().as_deref(),
+            Some("key-b")
+        );
         assert!(session_auth(&headers, "gamma").is_err());
     }
 
