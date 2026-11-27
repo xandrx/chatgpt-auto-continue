@@ -1,0 +1,24 @@
+name: Dispatcher Rust CI
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'dispatcher/rust/**'
+      - '.github/workflows/dispatcher-rust.yml'
+  push:
+    paths:
+      - 'dispatcher/rust/**'
+      - '.github/workflows/dispatcher-rust.yml'
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dispatcher/rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+      - run: cargo build --release

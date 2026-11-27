@@ -1,0 +1,213 @@
+use axum::{
+    extract::{DefaultBodyLimit, Path, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    middleware::{self, Next},
+    extract::Request,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use chatgpt_session_dispatcher::{digest, now, same_digest, Client, Error, Store};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::{env, path::PathBuf};
+
+#[derive(Clone)]
+struct App { store: Store, operator_digest: String }
+
+struct ApiError(Error);
+impl From<Error> for ApiError {
+    fn from(error: Error) -> Self { Self(error) }
+}
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self.0 {
+            Error::Invalid(field) => (StatusCode::BAD_REQUEST, field),
+            Error::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            Error::NotFound => (StatusCode::NOT_FOUND, "not found"),
+            Error::Conflict(reason) => (StatusCode::CONFLICT, reason),
+            Error::Database(_) => {
+                // Never log SQL parameters, prompts or credentials.
+                tracing::error!("database operation failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "database error")
+            }
+        };
+        (status, Json(json!({"error":message}))).into_response()
+    }
+}
+type ApiResult<T> = Result<T, ApiError>;
+
+fn bearer(headers: &HeaderMap) -> ApiResult<&str> {
+    headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|v| !v.is_empty() && v.len() <= 512)
+        .ok_or(ApiError(Error::Unauthorized))
+}
+fn operator(app: &App, headers: &HeaderMap) -> ApiResult<()> {
+    if !same_digest(&app.operator_digest, &digest(bearer(headers)?)) {
+        return Err(ApiError(Error::Unauthorized));
+    }
+    Ok(())
+}
+async fn no_cache(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Enroll { chat_id: String, alias: String, #[serde(default)] export_allowed: bool }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Enqueue { request_id: String, session_id: String, prompt: String, ttl_seconds: i64 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientRequest { chat_id: String, worker: String, epoch: i64 }
+impl ClientRequest {
+    fn client(self, session_id: String) -> Client {
+        Client { session_id, chat_id: self.chat_id, worker: self.worker, epoch: self.epoch }
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Heartbeat { chat_id: String, worker: String, epoch: i64, status: String }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Ack { chat_id: String, worker: String, epoch: i64, request_id: String, state: String, #[serde(default)] result: String }
+
+async fn health() -> Json<Value> { Json(json!({"ok":true,"protocol":1,"version":env!("CARGO_PKG_VERSION")})) }
+async fn enroll(State(app): State<App>, headers: HeaderMap, Json(req): Json<Enroll>) -> ApiResult<Json<Value>> {
+    operator(&app, &headers)?;
+    let enrolled = app.store.enroll(&req.chat_id, &req.alias, req.export_allowed, now()).await?;
+    Ok(Json(json!(enrolled)))
+}
+async fn list(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    operator(&app, &headers)?;
+    Ok(Json(json!({"sessions":app.store.list(now()).await?})))
+}
+async fn revoke(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    operator(&app, &headers)?;
+    app.store.revoke(&id, now()).await?;
+    Ok(Json(json!({"ok":true})))
+}
+async fn enqueue(State(app): State<App>, headers: HeaderMap, Json(req): Json<Enqueue>) -> ApiResult<Json<Value>> {
+    operator(&app, &headers)?;
+    Ok(Json(json!(app.store.enqueue(&req.request_id, &req.session_id, &req.prompt, req.ttl_seconds, now()).await?)))
+}
+async fn job(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    operator(&app, &headers)?;
+    Ok(Json(json!(app.store.job(&id, now()).await?)))
+}
+async fn cancel(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    operator(&app, &headers)?;
+    Ok(Json(json!(app.store.cancel(&id, now()).await?)))
+}
+async fn heartbeat(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, Json(req): Json<Heartbeat>) -> ApiResult<Json<Value>> {
+    let client = Client { session_id:id, chat_id:req.chat_id, worker:req.worker, epoch:req.epoch };
+    Ok(Json(json!(app.store.heartbeat(&client, bearer(&headers)?, &req.status, now()).await?)))
+}
+async fn claim(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, Json(req): Json<ClientRequest>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!({"job":app.store.claim(&req.client(id), bearer(&headers)?, now()).await?})))
+}
+async fn ack(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, Json(req): Json<Ack>) -> ApiResult<Json<Value>> {
+    let client = Client { session_id:id, chat_id:req.chat_id, worker:req.worker, epoch:req.epoch };
+    Ok(Json(json!(app.store.ack(&client, bearer(&headers)?, &req.request_id, &req.state, &req.result, now()).await?)))
+}
+fn router(app: App) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/v1/sessions", get(list).post(enroll))
+        .route("/v1/sessions/{id}/revoke", post(revoke))
+        .route("/v1/sessions/{id}/heartbeat", post(heartbeat))
+        .route("/v1/sessions/{id}/claim", post(claim))
+        .route("/v1/sessions/{id}/ack", post(ack))
+        .route("/v1/jobs", post(enqueue))
+        .route("/v1/jobs/{id}", get(job))
+        .route("/v1/jobs/{id}/cancel", post(cancel))
+        .layer(DefaultBodyLimit::max(512 * 1024))
+        .layer(middleware::from_fn(no_cache))
+        .with_state(app)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+    async fn call(app: &Router, method: &str, path: &str, auth: Option<&str>, payload: Value) -> (StatusCode, Value) {
+        let mut builder = axum::http::Request::builder().method(method).uri(path).header(header::CONTENT_TYPE, "application/json");
+        if let Some(value) = auth { builder = builder.header(header::AUTHORIZATION, format!("Bearer {value}")); }
+        let response = app.clone().oneshot(builder.body(Body::from(payload.to_string())).unwrap()).await.unwrap();
+        let status = response.status();
+        assert_eq!(response.headers().get(header::CACHE_CONTROL).unwrap().to_str().unwrap(), "no-store");
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        (status, value)
+    }
+    #[tokio::test]
+    async fn api_auth_scope_and_job_lifecycle() {
+        let directory = std::env::temp_dir().join(format!("csd-api-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("api.sqlite3");
+        let store = Store::open(&path).await.unwrap();
+        let operator_key = uuid::Uuid::new_v4().to_string();
+        let app = router(App {store, operator_digest:digest(&operator_key)});
+        let (status, _) = call(&app,"GET","/health",None,Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(&app,"GET","/v1/sessions",None,Value::Null).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, enrolled) = call(&app,"POST","/v1/sessions",Some(&operator_key),json!({"chat_id":"fixture-chat","alias":"Test"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let sid = enrolled["session"]["id"].as_str().unwrap();
+        let session_key = enrolled["credential"].as_str().unwrap();
+        let (status, _) = call(&app,"GET","/v1/sessions",Some(session_key),Value::Null).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, listed) = call(&app,"GET","/v1/sessions",Some(&operator_key),Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!listed.to_string().contains(session_key));
+        assert!(!listed.to_string().contains("credential_hash"));
+        let prefix = format!("/v1/sessions/{sid}");
+        let (status, _) = call(&app,"POST",&format!("{prefix}/heartbeat"),Some(session_key),json!({"chat_id":"different","worker":"test","epoch":0,"status":"idle"})).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, lease) = call(&app,"POST",&format!("{prefix}/heartbeat"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":0,"status":"idle"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let epoch = lease["epoch"].as_i64().unwrap();
+        let (status, _) = call(&app,"POST","/v1/jobs",Some(&operator_key),json!({"request_id":"r1","session_id":sid,"prompt":"fixture task","ttl_seconds":600})).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, claimed) = call(&app,"POST",&format!("{prefix}/claim"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(claimed["job"]["id"],"r1");
+        let (status, _) = call(&app,"POST",&format!("{prefix}/ack"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"request_id":"r1","state":"completed"})).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = call(&app,"POST",&format!("{prefix}/ack"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"request_id":"r1","state":"submitted"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(&app,"POST",&format!("{prefix}/ack"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"request_id":"r1","state":"completed","result":"not allowed"})).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = call(&app,"POST",&format!("{prefix}/ack"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"request_id":"r1","state":"completed"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, job) = call(&app,"GET","/v1/jobs/r1",Some(&operator_key),Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(job["state"],"completed");
+        drop(app);
+        // SQLite's worker may close asynchronously; keep temp cleanup best effort on Windows.
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt().with_target(false).init();
+    let credential = env::var("DISPATCHER_ADMIN_TOKEN")
+        .map_err(|_| std::io::Error::other("DISPATCHER_ADMIN_TOKEN is required"))?;
+    if credential.len() < 32 || credential.len() > 512 {
+        return Err(std::io::Error::other("operator credential must contain 32–512 bytes").into());
+    }
+    let path = PathBuf::from(env::var_os("DISPATCHER_DB").unwrap_or_else(|| "dispatcher.sqlite3".into()));
+    // Bind first so a second local process cannot invalidate an active server's leases.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8766").await?;
+    let store = Store::open(&path).await.map_err(|_| std::io::Error::other("cannot initialize database"))?;
+    let app = App { store, operator_digest:digest(&credential) };
+    drop(credential);
+    tracing::info!("dispatcher development API listening on loopback");
+    axum::serve(listener, router(app)).await?;
+    Ok(())
+}

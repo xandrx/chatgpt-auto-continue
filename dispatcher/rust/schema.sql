@@ -1,0 +1,28 @@
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    chat_id TEXT NOT NULL UNIQUE,
+    alias TEXT NOT NULL,
+    credential_hash TEXT NOT NULL,
+    export_allowed INTEGER NOT NULL DEFAULT 0 CHECK(export_allowed IN (0,1)),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+    worker TEXT,
+    epoch INTEGER NOT NULL DEFAULT 0,
+    lease_until INTEGER NOT NULL DEFAULT 0,
+    seen INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'offline' CHECK(status IN ('offline','idle','busy','blocked'))
+);
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    prompt TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('queued','claimed','submitted','completed','failed','canceled','expired','uncertain')),
+    created INTEGER NOT NULL,
+    updated INTEGER NOT NULL,
+    expires INTEGER NOT NULL,
+    worker TEXT,
+    epoch INTEGER,
+    result TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(session_id,state,created,id);
+CREATE UNIQUE INDEX IF NOT EXISTS one_inflight ON jobs(session_id)
+WHERE state IN ('claimed','submitted','uncertain');
