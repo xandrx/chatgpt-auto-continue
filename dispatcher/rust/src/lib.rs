@@ -857,7 +857,11 @@ impl Store {
         // no longer acknowledge or mutate the job once the epoch changes.
         let old_worker_still_fenced =
             session.worker.as_deref() != job.worker.as_deref() || job.epoch != Some(session.epoch);
-        if session.lease_until > time && !old_worker_still_fenced {
+        // An operator-confirmed completion is itself sufficient evidence to
+        // fence a still-live worker: the state transition and lease invalidation
+        // happen atomically below. Never allow this shortcut for a failure
+        // verdict, where an in-flight worker could still complete the task.
+        if session.lease_until > time && !old_worker_still_fenced && outcome != "completed" {
             return Err(Error::Conflict(
                 "stop the worker or wait until the ambiguous job's worker is fenced",
             ));
@@ -1162,6 +1166,49 @@ mod tests {
         assert_eq!(reviewed.state, "completed");
         assert!(s.review("r1").await.unwrap().is_some());
         assert!(s.claim(&replacement, &e.credential, 283).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn verified_completion_atomically_fences_a_live_worker() {
+        let (s, e, client) = fixture(false).await;
+        s.enqueue("r1", &client.session_id, "test", 600, 101)
+            .await
+            .unwrap();
+        s.claim(&client, &e.credential, 102).await.unwrap().unwrap();
+        s.ack(&client, &e.credential, "r1", "submitted", "", 103)
+            .await
+            .unwrap();
+
+        // The operator has visually confirmed the answer in ChatGPT. Recording
+        // completion also fences the live worker in the same transaction.
+        let reviewed = s
+            .resolve(
+                "r1",
+                "completed",
+                "User confirmed the prompt and final answer are visible in ChatGPT",
+                104,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reviewed.state, "completed");
+        assert!(s.review("r1").await.unwrap().is_some());
+        assert!(s
+            .ack(&client, &e.credential, "r1", "completed", "late ack", 105)
+            .await
+            .is_err());
+        let session = s
+            .list(105)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|session| session.id == client.session_id)
+            .unwrap();
+        assert_eq!(session.status, "offline");
+        assert_eq!(session.lease_until, 0);
+        assert!(!session.online);
+        assert_eq!(s.job("r1", 105).await.unwrap().state, "completed");
+        let task = s.dispatch_task_status("r1", 105).await.unwrap().unwrap();
+        assert_eq!(task.state, "completed");
     }
 
     #[tokio::test]
