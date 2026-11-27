@@ -72,6 +72,8 @@ def run(binary):
                 except urllib.error.URLError:
                     assert time.monotonic() < deadline, "startup timeout"
                     time.sleep(0.1)
+            request("POST", "/v1/client/enroll", admin,
+                    {"chat_id": "disabled-enrollment", "alias": "fixture"}, expected=401)
             enrolled = request("POST", "/v1/sessions", admin,
                                {"chat_id": "mcp-fixture", "alias": "fixture"})
             sid = enrolled["session"]["id"]

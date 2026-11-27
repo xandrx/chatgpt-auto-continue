@@ -18,6 +18,7 @@ use std::{env, path::PathBuf};
 struct App {
     store: Store,
     operator_digest: String,
+    enroll_digest: Option<String>,
 }
 
 struct ApiError(Error);
@@ -135,6 +136,24 @@ async fn enroll(
     Json(req): Json<Enroll>,
 ) -> ApiResult<Json<Value>> {
     operator(&app, &headers)?;
+    let enrolled = app
+        .store
+        .enroll(&req.chat_id, &req.alias, req.export_allowed, now())
+        .await?;
+    Ok(Json(json!(enrolled)))
+}
+async fn client_enroll(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<Enroll>,
+) -> ApiResult<Json<Value>> {
+    let expected = app
+        .enroll_digest
+        .as_deref()
+        .ok_or(ApiError(Error::Unauthorized))?;
+    if !same_digest(expected, &digest(bearer(&headers)?)) {
+        return Err(ApiError(Error::Unauthorized));
+    }
     let enrolled = app
         .store
         .enroll(&req.chat_id, &req.alias, req.export_allowed, now())
@@ -309,6 +328,7 @@ fn router(app: App) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/sessions", get(list).post(enroll))
+        .route("/v1/client/enroll", post(client_enroll))
         .route("/v1/sessions/{id}/revoke", post(revoke))
         .route("/v1/sessions/{id}/heartbeat", post(heartbeat))
         .route("/v1/sessions/{id}/claim", post(claim))
@@ -361,6 +381,56 @@ mod tests {
         (status, value)
     }
     #[tokio::test]
+    async fn client_enrollment_uses_a_separate_scoped_credential() {
+        let directory =
+            std::env::temp_dir().join(format!("csd-enroll-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = Store::open(directory.join("enroll.sqlite3")).await.unwrap();
+        let admin = uuid::Uuid::new_v4().to_string();
+        let enrollment = uuid::Uuid::new_v4().to_string();
+        let app = router(App {
+            store,
+            operator_digest: digest(&admin),
+            enroll_digest: Some(digest(&enrollment)),
+        });
+        let payload = json!({"chat_id":"client-chat","alias":"Client tab"});
+        let (status, _) = call(&app, "POST", "/v1/client/enroll", None, payload.clone()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/client/enroll",
+            Some(&admin),
+            payload.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, enrolled) = call(
+            &app,
+            "POST",
+            "/v1/client/enroll",
+            Some(&enrollment),
+            payload.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let session_key = enrolled["credential"].as_str().unwrap();
+        let (status, _) = call(&app, "GET", "/v1/sessions", Some(session_key), Value::Null).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/client/enroll",
+            Some(session_key),
+            payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        drop(app);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
     async fn api_auth_scope_and_job_lifecycle() {
         let directory = std::env::temp_dir().join(format!("csd-api-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -370,6 +440,7 @@ mod tests {
         let app = router(App {
             store,
             operator_digest: digest(&operator_key),
+            enroll_digest: None,
         });
         let (status, _) = call(&app, "GET", "/health", None, Value::Null).await;
         assert_eq!(status, StatusCode::OK);
@@ -517,21 +588,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(&path)
         .await
         .map_err(|_| std::io::Error::other("cannot initialize database"))?;
-    let app = App {
-        store,
-        operator_digest: digest(&credential),
-    };
-    let observer = match env::var("DISPATCHER_OBSERVER_TOKEN") {
+    let enroll_digest = match env::var("DISPATCHER_ENROLL_TOKEN") {
         Ok(value)
             if value.len() >= 32
                 && value.len() <= 512
-                && !same_digest(&digest(&value), &app.operator_digest) =>
+                && !same_digest(&digest(&value), &digest(&credential)) =>
         {
             Some(digest(&value))
         }
         Ok(_) => {
             return Err(std::io::Error::other(
-                "observer credential must be separate and contain 32–512 bytes",
+                "enrollment credential must be 32–512 bytes and distinct from admin credential",
+            )
+            .into())
+        }
+        Err(env::VarError::NotPresent) => None,
+        Err(_) => return Err(std::io::Error::other("invalid enrollment credential").into()),
+    };
+    let app = App {
+        store,
+        operator_digest: digest(&credential),
+        enroll_digest,
+    };
+    let observer = match env::var("DISPATCHER_OBSERVER_TOKEN") {
+        Ok(value)
+            if value.len() >= 32
+                && value.len() <= 512
+                && !same_digest(&digest(&value), &app.operator_digest)
+                && app.enroll_digest.as_ref().is_none_or(|scope| !same_digest(scope, &digest(&value))) =>
+        {
+            Some(digest(&value))
+        }
+        Ok(_) => {
+            return Err(std::io::Error::other(
+                "observer credential must be 32–512 bytes and distinct from admin/enrollment credentials",
             )
             .into())
         }
@@ -543,7 +633,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if value.len() >= 32
                 && value.len() <= 512
                 && !same_digest(&digest(&value), &app.operator_digest)
-                && observer.as_ref().is_none_or(|scope| !same_digest(scope, &digest(&value))) =>
+                && observer.as_ref().is_none_or(|scope| !same_digest(scope, &digest(&value)))
+                && app.enroll_digest.as_ref().is_none_or(|scope| !same_digest(scope, &digest(&value))) =>
         {
             Some(digest(&value))
         }

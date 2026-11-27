@@ -36,8 +36,10 @@ def request(method, path, credential=None, payload=None, expected=200):
 
 def run(binary):
     admin = secrets.token_urlsafe(32)
+    enrollment = secrets.token_urlsafe(32)
     with tempfile.TemporaryDirectory() as tmp:
         env = dict(os.environ, DISPATCHER_ADMIN_TOKEN=admin,
+                   DISPATCHER_ENROLL_TOKEN=enrollment,
                    DISPATCHER_DB=str(Path(tmp) / "smoke.sqlite3"))
         proc = subprocess.Popen([str(binary)], env=env,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -51,6 +53,14 @@ def run(binary):
                 except urllib.error.URLError:
                     assert time.monotonic() < deadline, "startup timeout"
                     time.sleep(0.1)
+            client_enrolled = request("POST", "/v1/client/enroll", enrollment,
+                                      {"chat_id": "client-synthetic-chat", "alias": "client fixture"})
+            assert request("POST", "/v1/client/enroll", admin,
+                           {"chat_id": "wrong-admin", "alias": "wrong"}, expected=401)["error"] == "unauthorized"
+            assert request("GET", "/v1/sessions", client_enrolled["credential"],
+                           expected=401)["error"] == "unauthorized"
+            assert request("POST", "/v1/client/enroll", client_enrolled["credential"],
+                           {"chat_id": "wrong-session", "alias": "wrong"}, expected=401)["error"] == "unauthorized"
             session = request("POST", "/v1/sessions", admin,
                               {"chat_id": "synthetic-chat", "alias": "fixture"})
             sid = session["session"]["id"]
