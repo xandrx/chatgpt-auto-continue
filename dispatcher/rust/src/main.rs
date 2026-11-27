@@ -385,7 +385,9 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("csd-enroll-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
-        let store = Store::open(directory.join("enroll.sqlite3")).await.unwrap();
+        let store = Store::open(&directory.join("enroll.sqlite3"))
+            .await
+            .unwrap();
         let admin = uuid::Uuid::new_v4().to_string();
         let enrollment = uuid::Uuid::new_v4().to_string();
         let app = router(App {
