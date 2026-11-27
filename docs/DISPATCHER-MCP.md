@@ -1,5 +1,5 @@
 # MCP observation interface (development)
-Uses the official rmcp Rust SDK 3.12.0 with Streamable HTTP. The first interface is intentionally read-only and loopback-only. It is disabled unless DISPATCHER_OBSERVER_TOKEN is explicitly configured with a separate randomly generated credential (32–512 bytes). Neither the operator token nor a session credential grants observer access. The observer token cannot access the operator REST API. Origin-bearing requests are rejected; do not publish this development endpoint to the internet.
+Uses the official rmcp Rust SDK 3.12.0 with Streamable HTTP. The first interface is intentionally read-only and loopback-only. It is disabled unless DISPATCHER_OBSERVER_TOKEN is explicitly configured with a separate randomly generated credential (32–512 bytes). Neither the operator token nor a session credential grants observer access. The observer token cannot access the operator REST API. Origin-bearing requests are rejected and every MCP response carries Cache-Control: no-store. MCP session listings deliberately omit the underlying ChatGPT chat_id; use the generated session ID and human-readable alias. Do not publish this development endpoint to the internet.
 
 Endpoint: http://127.0.0.1:8766/mcp
 Tools:

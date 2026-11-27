@@ -1,9 +1,9 @@
 mod mcp;
 use axum::{
+    extract::Request,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
-    extract::Request,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -14,11 +14,16 @@ use serde_json::{json, Value};
 use std::{env, path::PathBuf};
 
 #[derive(Clone)]
-struct App { store: Store, operator_digest: String }
+struct App {
+    store: Store,
+    operator_digest: String,
+}
 
 struct ApiError(Error);
 impl From<Error> for ApiError {
-    fn from(error: Error) -> Self { Self(error) }
+    fn from(error: Error) -> Self {
+        Self(error)
+    }
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -39,7 +44,9 @@ impl IntoResponse for ApiError {
 type ApiResult<T> = Result<T, ApiError>;
 
 fn bearer(headers: &HeaderMap) -> ApiResult<&str> {
-    headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .filter(|v| !v.is_empty() && v.len() <= 512)
         .ok_or(ApiError(Error::Unauthorized))
@@ -52,37 +59,85 @@ fn operator(app: &App, headers: &HeaderMap) -> ApiResult<()> {
 }
 async fn no_cache(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
-    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Enroll { chat_id: String, alias: String, #[serde(default)] export_allowed: bool }
+struct Enroll {
+    chat_id: String,
+    alias: String,
+    #[serde(default)]
+    export_allowed: bool,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Enqueue { request_id: String, session_id: String, prompt: String, ttl_seconds: i64 }
+struct Enqueue {
+    request_id: String,
+    session_id: String,
+    prompt: String,
+    ttl_seconds: i64,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ClientRequest { chat_id: String, worker: String, epoch: i64 }
+struct ClientRequest {
+    chat_id: String,
+    worker: String,
+    epoch: i64,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WaitRequest { chat_id: String, worker: String, epoch: i64, wait_ms: u64 }
+struct WaitRequest {
+    chat_id: String,
+    worker: String,
+    epoch: i64,
+    wait_ms: u64,
+}
 impl ClientRequest {
     fn client(self, session_id: String) -> Client {
-        Client { session_id, chat_id: self.chat_id, worker: self.worker, epoch: self.epoch }
+        Client {
+            session_id,
+            chat_id: self.chat_id,
+            worker: self.worker,
+            epoch: self.epoch,
+        }
     }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Heartbeat { chat_id: String, worker: String, epoch: i64, status: String }
+struct Heartbeat {
+    chat_id: String,
+    worker: String,
+    epoch: i64,
+    status: String,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Ack { chat_id: String, worker: String, epoch: i64, request_id: String, state: String, #[serde(default)] result: String }
+struct Ack {
+    chat_id: String,
+    worker: String,
+    epoch: i64,
+    request_id: String,
+    state: String,
+    #[serde(default)]
+    result: String,
+}
 
-async fn health() -> Json<Value> { Json(json!({"ok":true,"protocol":1,"version":env!("CARGO_PKG_VERSION")})) }
-async fn enroll(State(app): State<App>, headers: HeaderMap, Json(req): Json<Enroll>) -> ApiResult<Json<Value>> {
+async fn health() -> Json<Value> {
+    Json(json!({"ok":true,"protocol":1,"version":env!("CARGO_PKG_VERSION")}))
+}
+async fn enroll(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<Enroll>,
+) -> ApiResult<Json<Value>> {
     operator(&app, &headers)?;
-    let enrolled = app.store.enroll(&req.chat_id, &req.alias, req.export_allowed, now()).await?;
+    let enrolled = app
+        .store
+        .enroll(&req.chat_id, &req.alias, req.export_allowed, now())
+        .await?;
     Ok(Json(json!(enrolled)))
 }
 #[derive(Deserialize)]
@@ -92,54 +147,162 @@ struct SessionQuery {
     after: String,
     limit: Option<u32>,
 }
-async fn list(State(app): State<App>, headers: HeaderMap, Query(query): Query<SessionQuery>) -> ApiResult<Json<Value>> {
+async fn list(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<SessionQuery>,
+) -> ApiResult<Json<Value>> {
     operator(&app, &headers)?;
-    Ok(Json(json!(app.store.list_page(&query.after, query.limit.unwrap_or(200), now()).await?)))
+    Ok(Json(json!(
+        app.store
+            .list_page(&query.after, query.limit.unwrap_or(200), now())
+            .await?
+    )))
 }
-async fn revoke(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+async fn revoke(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
     operator(&app, &headers)?;
     app.store.revoke(&id, now()).await?;
     Ok(Json(json!({"ok":true})))
 }
-async fn enqueue(State(app): State<App>, headers: HeaderMap, Json(req): Json<Enqueue>) -> ApiResult<Json<Value>> {
+async fn enqueue(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<Enqueue>,
+) -> ApiResult<Json<Value>> {
     operator(&app, &headers)?;
-    Ok(Json(json!(app.store.enqueue(&req.request_id, &req.session_id, &req.prompt, req.ttl_seconds, now()).await?)))
+    Ok(Json(json!(
+        app.store
+            .enqueue(
+                &req.request_id,
+                &req.session_id,
+                &req.prompt,
+                req.ttl_seconds,
+                now()
+            )
+            .await?
+    )))
 }
-async fn job(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+async fn job(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
     operator(&app, &headers)?;
     Ok(Json(json!(app.store.job(&id, now()).await?)))
 }
-async fn cancel(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+async fn cancel(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
     operator(&app, &headers)?;
     Ok(Json(json!(app.store.cancel(&id, now()).await?)))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Resolve { outcome: String, note: String, verified: bool }
-async fn resolve(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, Json(req): Json<Resolve>) -> ApiResult<Json<Value>> {
-    operator(&app, &headers)?;
-    if !req.verified { return Err(ApiError(Error::Invalid("explicit verification required"))); }
-    let job = app.store.resolve(&id, &req.outcome, &req.note, now()).await?;
-    Ok(Json(json!({"job":job,"review":app.store.review(&id).await?})))
+struct Resolve {
+    outcome: String,
+    note: String,
+    verified: bool,
 }
-async fn get_review(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+async fn resolve(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<Resolve>,
+) -> ApiResult<Json<Value>> {
+    operator(&app, &headers)?;
+    if !req.verified {
+        return Err(ApiError(Error::Invalid("explicit verification required")));
+    }
+    let job = app
+        .store
+        .resolve(&id, &req.outcome, &req.note, now())
+        .await?;
+    Ok(Json(
+        json!({"job":job,"review":app.store.review(&id).await?}),
+    ))
+}
+async fn get_review(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
     operator(&app, &headers)?;
     Ok(Json(json!({"review":app.store.review(&id).await?})))
 }
-async fn heartbeat(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, Json(req): Json<Heartbeat>) -> ApiResult<Json<Value>> {
-    let client = Client { session_id:id, chat_id:req.chat_id, worker:req.worker, epoch:req.epoch };
-    Ok(Json(json!(app.store.heartbeat(&client, bearer(&headers)?, &req.status, now()).await?)))
+async fn heartbeat(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<Heartbeat>,
+) -> ApiResult<Json<Value>> {
+    let client = Client {
+        session_id: id,
+        chat_id: req.chat_id,
+        worker: req.worker,
+        epoch: req.epoch,
+    };
+    Ok(Json(json!(
+        app.store
+            .heartbeat(&client, bearer(&headers)?, &req.status, now())
+            .await?
+    )))
 }
-async fn claim(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, Json(req): Json<ClientRequest>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!({"job":app.store.claim(&req.client(id), bearer(&headers)?, now()).await?})))
+async fn claim(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<ClientRequest>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(
+        json!({"job":app.store.claim(&req.client(id), bearer(&headers)?, now()).await?}),
+    ))
 }
-async fn wait(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, Json(req): Json<WaitRequest>) -> ApiResult<Json<Value>> {
-    let client = Client { session_id:id, chat_id:req.chat_id, worker:req.worker, epoch:req.epoch };
-    Ok(Json(json!({"job":app.store.claim_wait(&client, bearer(&headers)?, req.wait_ms).await?})))
+async fn wait(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<WaitRequest>,
+) -> ApiResult<Json<Value>> {
+    let client = Client {
+        session_id: id,
+        chat_id: req.chat_id,
+        worker: req.worker,
+        epoch: req.epoch,
+    };
+    Ok(Json(
+        json!({"job":app.store.claim_wait(&client, bearer(&headers)?, req.wait_ms).await?}),
+    ))
 }
-async fn ack(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, Json(req): Json<Ack>) -> ApiResult<Json<Value>> {
-    let client = Client { session_id:id, chat_id:req.chat_id, worker:req.worker, epoch:req.epoch };
-    Ok(Json(json!(app.store.ack(&client, bearer(&headers)?, &req.request_id, &req.state, &req.result, now()).await?)))
+async fn ack(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<Ack>,
+) -> ApiResult<Json<Value>> {
+    let client = Client {
+        session_id: id,
+        chat_id: req.chat_id,
+        worker: req.worker,
+        epoch: req.epoch,
+    };
+    Ok(Json(json!(
+        app.store
+            .ack(
+                &client,
+                bearer(&headers)?,
+                &req.request_id,
+                &req.state,
+                &req.result,
+                now()
+            )
+            .await?
+    )))
 }
 fn router(app: App) -> Router {
     Router::new()
@@ -161,14 +324,37 @@ fn router(app: App) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::{Body, to_bytes};
+    use axum::body::{to_bytes, Body};
     use tower::ServiceExt;
-    async fn call(app: &Router, method: &str, path: &str, auth: Option<&str>, payload: Value) -> (StatusCode, Value) {
-        let mut builder = axum::http::Request::builder().method(method).uri(path).header(header::CONTENT_TYPE, "application/json");
-        if let Some(value) = auth { builder = builder.header(header::AUTHORIZATION, format!("Bearer {value}")); }
-        let response = app.clone().oneshot(builder.body(Body::from(payload.to_string())).unwrap()).await.unwrap();
+    async fn call(
+        app: &Router,
+        method: &str,
+        path: &str,
+        auth: Option<&str>,
+        payload: Value,
+    ) -> (StatusCode, Value) {
+        let mut builder = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(value) = auth {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {value}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(payload.to_string())).unwrap())
+            .await
+            .unwrap();
         let status = response.status();
-        assert_eq!(response.headers().get(header::CACHE_CONTROL).unwrap().to_str().unwrap(), "no-store");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "no-store"
+        );
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         (status, value)
@@ -180,34 +366,86 @@ mod tests {
         let path = directory.join("api.sqlite3");
         let store = Store::open(&path).await.unwrap();
         let operator_key = uuid::Uuid::new_v4().to_string();
-        let app = router(App {store, operator_digest:digest(&operator_key)});
-        let (status, _) = call(&app,"GET","/health",None,Value::Null).await;
+        let app = router(App {
+            store,
+            operator_digest: digest(&operator_key),
+        });
+        let (status, _) = call(&app, "GET", "/health", None, Value::Null).await;
         assert_eq!(status, StatusCode::OK);
-        let (status, _) = call(&app,"GET","/v1/sessions",None,Value::Null).await;
+        let (status, _) = call(&app, "GET", "/v1/sessions", None, Value::Null).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let (status, enrolled) = call(&app,"POST","/v1/sessions",Some(&operator_key),json!({"chat_id":"fixture-chat","alias":"Test"})).await;
+        let (status, enrolled) = call(
+            &app,
+            "POST",
+            "/v1/sessions",
+            Some(&operator_key),
+            json!({"chat_id":"fixture-chat","alias":"Test"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let sid = enrolled["session"]["id"].as_str().unwrap();
         let session_key = enrolled["credential"].as_str().unwrap();
-        let (status, _) = call(&app,"GET","/v1/sessions",Some(session_key),Value::Null).await;
+        let (status, _) = call(&app, "GET", "/v1/sessions", Some(session_key), Value::Null).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let (status, listed) = call(&app,"GET","/v1/sessions",Some(&operator_key),Value::Null).await;
+        let (status, listed) = call(
+            &app,
+            "GET",
+            "/v1/sessions",
+            Some(&operator_key),
+            Value::Null,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert!(!listed.to_string().contains(session_key));
         assert!(!listed.to_string().contains("credential_hash"));
         let prefix = format!("/v1/sessions/{sid}");
-        let (status, _) = call(&app,"POST",&format!("{prefix}/heartbeat"),Some(session_key),json!({"chat_id":"different","worker":"test","epoch":0,"status":"idle"})).await;
+        let (status, _) = call(
+            &app,
+            "POST",
+            &format!("{prefix}/heartbeat"),
+            Some(session_key),
+            json!({"chat_id":"different","worker":"test","epoch":0,"status":"idle"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let (status, lease) = call(&app,"POST",&format!("{prefix}/heartbeat"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":0,"status":"idle"})).await;
+        let (status, lease) = call(
+            &app,
+            "POST",
+            &format!("{prefix}/heartbeat"),
+            Some(session_key),
+            json!({"chat_id":"fixture-chat","worker":"test","epoch":0,"status":"idle"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let epoch = lease["epoch"].as_i64().unwrap();
-        let (status, _) = call(&app,"POST","/v1/jobs",Some(&operator_key),json!({"request_id":"r1","session_id":sid,"prompt":"fixture task","ttl_seconds":600})).await;
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/jobs",
+            Some(&operator_key),
+            json!({"request_id":"r1","session_id":sid,"prompt":"fixture task","ttl_seconds":600}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
-        let (status, _) = call(&app,"POST",&format!("{prefix}/wait"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"wait_ms":25001})).await;
+        let (status, _) = call(
+            &app,
+            "POST",
+            &format!("{prefix}/wait"),
+            Some(session_key),
+            json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"wait_ms":25001}),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        let (status, claimed) = call(&app,"POST",&format!("{prefix}/wait"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"wait_ms":100})).await;
+        let (status, claimed) = call(
+            &app,
+            "POST",
+            &format!("{prefix}/wait"),
+            Some(session_key),
+            json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"wait_ms":100}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(claimed["job"]["id"],"r1");
+        assert_eq!(claimed["job"]["id"], "r1");
         let (status, _) = call(&app,"POST",&format!("{prefix}/ack"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"request_id":"r1","state":"completed"})).await;
         assert_eq!(status, StatusCode::CONFLICT);
         let (status, _) = call(&app,"POST",&format!("{prefix}/ack"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"request_id":"r1","state":"submitted"})).await;
@@ -216,16 +454,45 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         let (status, _) = call(&app,"POST",&format!("{prefix}/ack"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"request_id":"r1","state":"completed"})).await;
         assert_eq!(status, StatusCode::OK);
-        let (status, job) = call(&app,"GET","/v1/jobs/r1",Some(&operator_key),Value::Null).await;
+        let (status, job) =
+            call(&app, "GET", "/v1/jobs/r1", Some(&operator_key), Value::Null).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(job["state"],"completed");
-        let (status, _) = call(&app,"POST","/v1/jobs/r1/review",Some(session_key),json!({"outcome":"completed","note":"fixture","verified":true})).await;
+        assert_eq!(job["state"], "completed");
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/jobs/r1/review",
+            Some(session_key),
+            json!({"outcome":"completed","note":"fixture","verified":true}),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let (status, _) = call(&app,"POST","/v1/jobs/r1/review",Some(&operator_key),json!({"outcome":"completed","note":"fixture","verified":false})).await;
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/jobs/r1/review",
+            Some(&operator_key),
+            json!({"outcome":"completed","note":"fixture","verified":false}),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        let (status, _) = call(&app,"POST","/v1/jobs/r1/review",Some(&operator_key),json!({"outcome":"completed","note":"fixture","verified":true})).await;
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/jobs/r1/review",
+            Some(&operator_key),
+            json!({"outcome":"completed","note":"fixture","verified":true}),
+        )
+        .await;
         assert_eq!(status, StatusCode::CONFLICT);
-        let (status, empty) = call(&app,"POST",&format!("{prefix}/wait"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"wait_ms":10})).await;
+        let (status, empty) = call(
+            &app,
+            "POST",
+            &format!("{prefix}/wait"),
+            Some(session_key),
+            json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"wait_ms":10}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert!(empty["job"].is_null());
         drop(app);
@@ -242,20 +509,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if credential.len() < 32 || credential.len() > 512 {
         return Err(std::io::Error::other("operator credential must contain 32–512 bytes").into());
     }
-    let path = PathBuf::from(env::var_os("DISPATCHER_DB").unwrap_or_else(|| "dispatcher.sqlite3".into()));
+    let path =
+        PathBuf::from(env::var_os("DISPATCHER_DB").unwrap_or_else(|| "dispatcher.sqlite3".into()));
     // Bind first so a second local process cannot invalidate an active server's leases.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8766").await?;
-    let store = Store::open(&path).await.map_err(|_| std::io::Error::other("cannot initialize database"))?;
-    let app = App { store, operator_digest:digest(&credential) };
+    let store = Store::open(&path)
+        .await
+        .map_err(|_| std::io::Error::other("cannot initialize database"))?;
+    let app = App {
+        store,
+        operator_digest: digest(&credential),
+    };
     let observer = match env::var("DISPATCHER_OBSERVER_TOKEN") {
-        Ok(value) if value.len() >= 32 && value.len() <= 512 && !same_digest(&digest(&value), &app.operator_digest) => Some(digest(&value)),
-        Ok(_) => return Err(std::io::Error::other("observer credential must be separate and contain 32–512 bytes").into()),
+        Ok(value)
+            if value.len() >= 32
+                && value.len() <= 512
+                && !same_digest(&digest(&value), &app.operator_digest) =>
+        {
+            Some(digest(&value))
+        }
+        Ok(_) => {
+            return Err(std::io::Error::other(
+                "observer credential must be separate and contain 32–512 bytes",
+            )
+            .into())
+        }
         Err(env::VarError::NotPresent) => None,
         Err(_) => return Err(std::io::Error::other("invalid observer credential").into()),
     };
     drop(credential);
     let mut routes = router(app.clone());
-    if let Some(scope) = observer { routes = routes.merge(mcp::routes(app.store.clone(), scope)); }
+    if let Some(scope) = observer {
+        routes = routes.merge(mcp::routes(app.store.clone(), scope));
+    }
     tracing::info!("dispatcher development API listening on loopback");
     axum::serve(listener, routes).await?;
     Ok(())

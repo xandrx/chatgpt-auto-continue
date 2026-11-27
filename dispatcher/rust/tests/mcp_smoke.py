@@ -12,7 +12,7 @@ import urllib.request
 from http_smoke import request, BASE, OPENER
 
 
-def rpc(body, credential=None, session=None, version=None, expected=200):
+def rpc(body, credential=None, session=None, version=None, expected=200, origin=None):
     headers = {"Content-Type": "application/json",
                "Accept": "application/json, text/event-stream"}
     if credential:
@@ -21,6 +21,8 @@ def rpc(body, credential=None, session=None, version=None, expected=200):
         headers["Mcp-Session-Id"] = session
     if version:
         headers["MCP-Protocol-Version"] = version
+    if origin:
+        headers["Origin"] = origin
     req = urllib.request.Request(BASE + "/mcp", data=json.dumps(body).encode(),
                                  headers=headers, method="POST")
     try:
@@ -29,16 +31,23 @@ def rpc(body, credential=None, session=None, version=None, expected=200):
         response = exc
     with response:
         assert response.status == expected, (response.status, expected)
+        assert response.headers.get("Cache-Control") == "no-store"
         sid = response.headers.get("Mcp-Session-Id")
         if expected != 200:
             return None, sid
         if "text/event-stream" in response.headers.get("Content-Type", ""):
             for line in response:
-                if line.startswith(b"data:"):
-                    item = json.loads(line[5:].strip())
-                    if item.get("id") == body.get("id"):
-                        return item, sid
-            raise AssertionError("no matching MCP response")
+                # Streamable HTTP may emit empty data frames/keep-alives.
+                # Only a non-empty JSON-RPC payload can satisfy this request.
+                if not line.startswith(b"data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload:
+                    continue
+                item = json.loads(payload)
+                if item.get("id") == body.get("id"):
+                    return item, sid
+            raise AssertionError("no matching MCP response; stream ended")
         return json.load(response), sid
 
 
@@ -74,6 +83,7 @@ def run(binary):
             rpc(initialize, expected=401)
             rpc(initialize, admin, expected=401)
             rpc(initialize, enrolled["credential"], expected=401)
+            rpc(initialize, observer, expected=403, origin="https://evil.example")
             request("GET", "/v1/sessions", observer, expected=401)
             result, session = rpc(initialize, observer)
             assert "result" in result, result
@@ -84,7 +94,16 @@ def run(binary):
                             observer, session, version)
             names = {tool["name"] for tool in listed["result"]["tools"]}
             assert names == {"list_sessions", "get_task_status"}, names
-            result, _ = rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            listed_sessions, _ = rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                                      "params": {"name": "list_sessions", "arguments": {"limit": 100}}},
+                                     observer, session, version)
+            assert not listed_sessions["result"].get("isError"), listed_sessions
+            session_text = listed_sessions["result"]["content"][0]["text"]
+            assert "mcp-fixture" not in session_text
+            assert "fixture" in session_text
+            assert "credential" not in session_text
+
+            result, _ = rpc({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                              "params": {"name": "get_task_status",
                                         "arguments": {"request_id": "mcp-job"}}},
                             observer, session, version)
@@ -92,7 +111,7 @@ def run(binary):
             text = result["result"]["content"][0]["text"]
             assert "synthetic private payload" not in text
             assert json.loads(text)["state"] == "queued"
-            print("MCP smoke passed: initialization, scoped auth, read-only tools, metadata-only status")
+            print("MCP smoke passed: initialization, scoped auth, origin rejection, no-store, redacted sessions, metadata-only status")
         finally:
             proc.terminate()
             try:

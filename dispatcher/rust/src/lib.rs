@@ -4,10 +4,19 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     FromRow, Sqlite, SqlitePool, Transaction,
 };
-use std::{path::Path, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, Weak},
+};
+use std::{
+    path::Path,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use subtle::ConstantTimeEq;
-use std::{collections::HashMap, sync::{Arc, Mutex, Weak}};
-use tokio::{sync::{watch, Semaphore}, time::Instant};
+use tokio::{
+    sync::{watch, Semaphore},
+    time::Instant,
+};
 use uuid::Uuid;
 
 pub const LEASE_SECONDS: i64 = 45;
@@ -25,19 +34,28 @@ pub enum Error {
     Database(sqlx::Error),
 }
 impl From<sqlx::Error> for Error {
-    fn from(e: sqlx::Error) -> Self { Self::Database(e) }
+    fn from(e: sqlx::Error) -> Self {
+        Self::Database(e)
+    }
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
-pub fn digest(value: &str) -> String { format!("{:x}", Sha256::digest(value.as_bytes())) }
+pub fn digest(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
 pub fn same_digest(a: &str, b: &str) -> bool {
     bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 fn validate(value: &str, max: usize, field: &'static str) -> Result<()> {
-    if value.trim().is_empty() || value.len() > max { return Err(Error::Invalid(field)); }
+    if value.trim().is_empty() || value.len() > max {
+        return Err(Error::Invalid(field));
+    }
     Ok(())
 }
 
@@ -50,16 +68,31 @@ pub struct Store {
 
 #[derive(Debug, FromRow)]
 struct Session {
-    id: String, chat_id: String, alias: String, credential_hash: String,
-    export_allowed: bool, enabled: bool, worker: Option<String>, epoch: i64,
-    lease_until: i64, seen: i64, status: String,
+    id: String,
+    chat_id: String,
+    alias: String,
+    credential_hash: String,
+    export_allowed: bool,
+    enabled: bool,
+    worker: Option<String>,
+    epoch: i64,
+    lease_until: i64,
+    seen: i64,
+    status: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SessionView {
-    pub id: String, pub chat_id: String, pub alias: String, pub export_allowed: bool,
-    pub enabled: bool, pub epoch: i64, pub lease_until: i64, pub seen: i64,
-    pub status: String, pub online: bool,
+    pub id: String,
+    pub chat_id: String,
+    pub alias: String,
+    pub export_allowed: bool,
+    pub enabled: bool,
+    pub epoch: i64,
+    pub lease_until: i64,
+    pub seen: i64,
+    pub status: String,
+    pub online: bool,
 }
 #[derive(Debug, Serialize)]
 pub struct SessionPage {
@@ -69,20 +102,42 @@ pub struct SessionPage {
 impl Session {
     fn view(self, time: i64) -> SessionView {
         let online = self.enabled && self.lease_until > time;
-        SessionView { id: self.id, chat_id: self.chat_id, alias: self.alias,
-            export_allowed: self.export_allowed, enabled: self.enabled, epoch: self.epoch,
-            lease_until: self.lease_until, seen: self.seen,
-            status: if online { self.status } else { "offline".into() }, online }
+        SessionView {
+            id: self.id,
+            chat_id: self.chat_id,
+            alias: self.alias,
+            export_allowed: self.export_allowed,
+            enabled: self.enabled,
+            epoch: self.epoch,
+            lease_until: self.lease_until,
+            seen: self.seen,
+            status: if online {
+                self.status
+            } else {
+                "offline".into()
+            },
+            online,
+        }
     }
 }
 #[derive(Serialize)]
-pub struct Enrollment { pub session: SessionView, pub credential: String }
+pub struct Enrollment {
+    pub session: SessionView,
+    pub credential: String,
+}
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Job {
-    pub id: String, pub session_id: String, pub prompt: String, pub state: String,
-    pub created: i64, pub updated: i64, pub expires: i64,
-    pub worker: Option<String>, pub epoch: Option<i64>, pub result: String,
+    pub id: String,
+    pub session_id: String,
+    pub prompt: String,
+    pub state: String,
+    pub created: i64,
+    pub updated: i64,
+    pub expires: i64,
+    pub worker: Option<String>,
+    pub epoch: Option<i64>,
+    pub result: String,
 }
 #[derive(Debug, Serialize, FromRow)]
 pub struct JobObservation {
@@ -102,22 +157,37 @@ pub struct Review {
 }
 #[derive(Debug, Clone)]
 pub struct Client {
-    pub session_id: String, pub chat_id: String, pub worker: String, pub epoch: i64,
+    pub session_id: String,
+    pub chat_id: String,
+    pub worker: String,
+    pub epoch: i64,
 }
 impl Store {
     pub async fn open(path: &Path) -> Result<Self> {
         let options = SqliteConnectOptions::new()
-            .filename(path).create_if_missing(true).foreign_keys(true)
-            .journal_mode(SqliteJournalMode::Wal).busy_timeout(Duration::from_secs(5));
+            .filename(path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
         let store = Self::connect(options).await?;
         store.recover_after_restart(now()).await?;
         Ok(store)
     }
     async fn connect(options: SqliteConnectOptions) -> Result<Self> {
         // A single connection serializes this small personal service's transactions.
-        let pool = SqlitePoolOptions::new().max_connections(1).connect_with(options).await?;
-        sqlx::raw_sql(include_str!("../schema.sql")).execute(&pool).await?;
-        Ok(Self { pool, changes: Arc::new(Mutex::new(HashMap::new())), waiters: Arc::new(Semaphore::new(MAX_WAITERS)) })
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        sqlx::raw_sql(include_str!("../schema.sql"))
+            .execute(&pool)
+            .await?;
+        Ok(Self {
+            pool,
+            changes: Arc::new(Mutex::new(HashMap::new())),
+            waiters: Arc::new(Semaphore::new(MAX_WAITERS)),
+        })
     }
     fn session_signal(&self, id: &str) -> Arc<watch::Sender<u64>> {
         let mut signals = self.changes.lock().unwrap_or_else(|e| e.into_inner());
@@ -144,52 +214,89 @@ impl Store {
     // Revoke every old lease; keep queued jobs and block ambiguous in-flight jobs.
     async fn recover_after_restart(&self, time: i64) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE jobs SET state='uncertain',updated=? WHERE state IN ('claimed','submitted')")
-            .bind(time).execute(&mut *tx).await?;
-        sqlx::query("UPDATE jobs SET state='expired',updated=? WHERE state='queued' AND expires<=?")
-            .bind(time).bind(time).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE jobs SET state='uncertain',updated=? WHERE state IN ('claimed','submitted')",
+        )
+        .bind(time)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE jobs SET state='expired',updated=? WHERE state='queued' AND expires<=?",
+        )
+        .bind(time)
+        .bind(time)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("UPDATE sessions SET worker=NULL,lease_until=0,epoch=epoch+1,status='offline'")
-            .execute(&mut *tx).await?;
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
     async fn session(tx: &mut Transaction<'_, Sqlite>, id: &str) -> Result<Session> {
-        sqlx::query_as("SELECT * FROM sessions WHERE id=?").bind(id)
-            .fetch_optional(&mut **tx).await?.ok_or(Error::NotFound)
+        sqlx::query_as("SELECT * FROM sessions WHERE id=?")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(Error::NotFound)
     }
-    async fn authenticate(tx: &mut Transaction<'_, Sqlite>, client: &Client, credential: &str) -> Result<Session> {
+    async fn authenticate(
+        tx: &mut Transaction<'_, Sqlite>,
+        client: &Client,
+        credential: &str,
+    ) -> Result<Session> {
         validate(&client.worker, 128, "worker")?;
-        let row = Self::session(tx, &client.session_id).await.map_err(|e| match e {
-            Error::NotFound => Error::Unauthorized, other => other,
-        })?;
-        if !row.enabled || row.chat_id != client.chat_id ||
-            !same_digest(&row.credential_hash, &digest(credential)) {
+        let row = Self::session(tx, &client.session_id)
+            .await
+            .map_err(|e| match e {
+                Error::NotFound => Error::Unauthorized,
+                other => other,
+            })?;
+        if !row.enabled
+            || row.chat_id != client.chat_id
+            || !same_digest(&row.credential_hash, &digest(credential))
+        {
             return Err(Error::Unauthorized);
         }
         Ok(row)
     }
     fn require_lease(row: &Session, client: &Client, time: i64) -> Result<()> {
-        if row.worker.as_deref() != Some(client.worker.as_str()) ||
-            row.epoch != client.epoch || row.lease_until <= time {
+        if row.worker.as_deref() != Some(client.worker.as_str())
+            || row.epoch != client.epoch
+            || row.lease_until <= time
+        {
             return Err(Error::Conflict("lease invalid"));
         }
         Ok(())
     }
-    pub async fn enroll(&self, chat: &str, alias: &str, export: bool, time: i64) -> Result<Enrollment> {
+    pub async fn enroll(
+        &self,
+        chat: &str,
+        alias: &str,
+        export: bool,
+        time: i64,
+    ) -> Result<Enrollment> {
         validate(chat, 256, "chat_id")?;
         validate(alias, 128, "alias")?;
         let id = Uuid::new_v4().to_string();
         let credential = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let mut tx = self.pool.begin().await?;
         let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE chat_id=?")
-            .bind(chat).fetch_one(&mut *tx).await?;
-        if exists != 0 { return Err(Error::Conflict("chat already enrolled")); }
+            .bind(chat)
+            .fetch_one(&mut *tx)
+            .await?;
+        if exists != 0 {
+            return Err(Error::Conflict("chat already enrolled"));
+        }
         sqlx::query("INSERT INTO sessions(id,chat_id,alias,credential_hash,export_allowed) VALUES(?,?,?,?,?)")
             .bind(&id).bind(chat).bind(alias).bind(digest(&credential)).bind(export)
             .execute(&mut *tx).await?;
         let session = Self::session(&mut tx, &id).await?.view(time);
         tx.commit().await?;
-        Ok(Enrollment { session, credential })
+        Ok(Enrollment {
+            session,
+            credential,
+        })
     }
     pub async fn list(&self, time: i64) -> Result<Vec<SessionView>> {
         Ok(self.list_page("", 200, time).await?.sessions)
@@ -199,13 +306,22 @@ impl Store {
             return Err(Error::Invalid("pagination"));
         }
         // Stable identifier ordering is unaffected by changing heartbeats.
-        let mut rows: Vec<Session> = sqlx::query_as("SELECT * FROM sessions WHERE id>? ORDER BY id LIMIT ?")
-            .bind(after).bind(i64::from(limit)+1).fetch_all(&self.pool).await?;
+        let mut rows: Vec<Session> =
+            sqlx::query_as("SELECT * FROM sessions WHERE id>? ORDER BY id LIMIT ?")
+                .bind(after)
+                .bind(i64::from(limit) + 1)
+                .fetch_all(&self.pool)
+                .await?;
         let next_after = if rows.len() > limit as usize {
             rows.pop();
             rows.last().map(|row| row.id.clone())
-        } else { None };
-        Ok(SessionPage { sessions: rows.into_iter().map(|s| s.view(time)).collect(), next_after })
+        } else {
+            None
+        };
+        Ok(SessionPage {
+            sessions: rows.into_iter().map(|s| s.view(time)).collect(),
+            next_after,
+        })
     }
     pub async fn revoke(&self, id: &str, time: i64) -> Result<()> {
         let mut tx = self.pool.begin().await?;
@@ -214,14 +330,27 @@ impl Store {
             .bind(id).execute(&mut *tx).await?;
         sqlx::query("UPDATE jobs SET state='uncertain',updated=? WHERE session_id=? AND state IN ('claimed','submitted')")
             .bind(time).bind(id).execute(&mut *tx).await?;
-        sqlx::query("UPDATE jobs SET state='canceled',updated=? WHERE session_id=? AND state='queued'")
-            .bind(time).bind(id).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE jobs SET state='canceled',updated=? WHERE session_id=? AND state='queued'",
+        )
+        .bind(time)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         self.notify_change(id);
         Ok(())
     }
-    pub async fn heartbeat(&self, client: &Client, credential: &str, status: &str, time: i64) -> Result<SessionView> {
-        if !matches!(status, "idle" | "busy" | "blocked") { return Err(Error::Invalid("status")); }
+    pub async fn heartbeat(
+        &self,
+        client: &Client,
+        credential: &str,
+        status: &str,
+        time: i64,
+    ) -> Result<SessionView> {
+        if !matches!(status, "idle" | "busy" | "blocked") {
+            return Err(Error::Invalid("status"));
+        }
         let mut tx = self.pool.begin().await?;
         let row = Self::authenticate(&mut tx, client, credential).await?;
         let epoch = if row.lease_until > time {
@@ -233,29 +362,55 @@ impl Store {
                 .bind(time).bind(&client.session_id).execute(&mut *tx).await?;
             row.epoch + 1
         };
-        sqlx::query("UPDATE sessions SET worker=?,epoch=?,lease_until=?,seen=?,status=? WHERE id=?")
-            .bind(&client.worker).bind(epoch).bind(time + LEASE_SECONDS).bind(time).bind(status)
-            .bind(&client.session_id).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE sessions SET worker=?,epoch=?,lease_until=?,seen=?,status=? WHERE id=?",
+        )
+        .bind(&client.worker)
+        .bind(epoch)
+        .bind(time + LEASE_SECONDS)
+        .bind(time)
+        .bind(status)
+        .bind(&client.session_id)
+        .execute(&mut *tx)
+        .await?;
         let view = Self::session(&mut tx, &client.session_id).await?.view(time);
         tx.commit().await?;
-        if row.status != status || row.epoch != epoch { self.notify_change(&client.session_id); }
+        if row.status != status || row.epoch != epoch {
+            self.notify_change(&client.session_id);
+        }
         Ok(view)
     }
-    pub async fn enqueue(&self, id: &str, session_id: &str, prompt: &str, ttl: i64, time: i64) -> Result<Job> {
+    pub async fn enqueue(
+        &self,
+        id: &str,
+        session_id: &str,
+        prompt: &str,
+        ttl: i64,
+        time: i64,
+    ) -> Result<Job> {
         validate(id, 128, "request_id")?;
         validate(prompt, MAX_PROMPT, "prompt")?;
-        if !(1..=86_400).contains(&ttl) { return Err(Error::Invalid("ttl_seconds")); }
+        if !(1..=86_400).contains(&ttl) {
+            return Err(Error::Invalid("ttl_seconds"));
+        }
         let mut tx = self.pool.begin().await?;
         let previous: Option<Job> = sqlx::query_as("SELECT * FROM jobs WHERE id=?")
-            .bind(id).fetch_optional(&mut *tx).await?;
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
         if let Some(job) = previous {
-            if job.session_id != session_id || job.prompt != prompt || job.expires - job.created != ttl {
+            if job.session_id != session_id
+                || job.prompt != prompt
+                || job.expires - job.created != ttl
+            {
                 return Err(Error::Conflict("request_id conflict"));
             }
             tx.commit().await?;
             return Ok(job);
         }
-        if !Self::session(&mut tx, session_id).await?.enabled { return Err(Error::Conflict("session revoked")); }
+        if !Self::session(&mut tx, session_id).await?.enabled {
+            return Err(Error::Conflict("session revoked"));
+        }
         sqlx::query("INSERT INTO jobs(id,session_id,prompt,state,created,updated,expires) VALUES(?,?,?,'queued',?,?,?)")
             .bind(id).bind(session_id).bind(prompt).bind(time).bind(time).bind(time + ttl)
             .execute(&mut *tx).await?;
@@ -265,8 +420,11 @@ impl Store {
         Ok(job)
     }
     async fn job_tx(tx: &mut Transaction<'_, Sqlite>, id: &str) -> Result<Job> {
-        sqlx::query_as("SELECT * FROM jobs WHERE id=?").bind(id)
-            .fetch_optional(&mut **tx).await?.ok_or(Error::NotFound)
+        sqlx::query_as("SELECT * FROM jobs WHERE id=?")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(Error::NotFound)
     }
     pub async fn job(&self, id: &str, time: i64) -> Result<Job> {
         let mut tx = self.pool.begin().await?;
@@ -287,9 +445,14 @@ impl Store {
     pub async fn cancel(&self, id: &str, time: i64) -> Result<Job> {
         let mut tx = self.pool.begin().await?;
         let job = Self::job_tx(&mut tx, id).await?;
-        if !matches!(job.state.as_str(), "queued" | "canceled") { return Err(Error::Conflict("only queued jobs can be canceled")); }
+        if !matches!(job.state.as_str(), "queued" | "canceled") {
+            return Err(Error::Conflict("only queued jobs can be canceled"));
+        }
         sqlx::query("UPDATE jobs SET state='canceled',updated=? WHERE id=? AND state='queued'")
-            .bind(time).bind(id).execute(&mut *tx).await?;
+            .bind(time)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         let job = Self::job_tx(&mut tx, id).await?;
         tx.commit().await?;
         Ok(job)
@@ -303,9 +466,12 @@ impl Store {
         }
         let mut tx = self.pool.begin().await?;
         let job = Self::job_tx(&mut tx, id).await?;
-        let prior: Option<(String,String)> = sqlx::query_as("SELECT outcome,note FROM job_reviews WHERE job_id=?")
-            .bind(id).fetch_optional(&mut *tx).await?;
-        if let Some((old_outcome,old_note)) = prior {
+        let prior: Option<(String, String)> =
+            sqlx::query_as("SELECT outcome,note FROM job_reviews WHERE job_id=?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some((old_outcome, old_note)) = prior {
             if old_outcome != outcome || old_note != note {
                 return Err(Error::Conflict("review already recorded"));
             }
@@ -314,15 +480,26 @@ impl Store {
         }
         let session = Self::session(&mut tx, &job.session_id).await?;
         if session.lease_until > time {
-            return Err(Error::Conflict("stop the worker and wait for lease expiration before review"));
+            return Err(Error::Conflict(
+                "stop the worker and wait for lease expiration before review",
+            ));
         }
         if !matches!(job.state.as_str(), "uncertain" | "claimed" | "submitted") {
             return Err(Error::Conflict("only ambiguous jobs can be reviewed"));
         }
         sqlx::query("INSERT INTO job_reviews(job_id,outcome,note,reviewed_at) VALUES(?,?,?,?)")
-            .bind(id).bind(outcome).bind(note).bind(time).execute(&mut *tx).await?;
+            .bind(id)
+            .bind(outcome)
+            .bind(note)
+            .bind(time)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("UPDATE jobs SET state=?,updated=? WHERE id=?")
-            .bind(outcome).bind(time).bind(id).execute(&mut *tx).await?;
+            .bind(outcome)
+            .bind(time)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("UPDATE sessions SET worker=NULL,epoch=epoch+1,lease_until=0,status='offline' WHERE id=?")
             .bind(&job.session_id).execute(&mut *tx).await?;
         let job = Self::job_tx(&mut tx, id).await?;
@@ -331,8 +508,14 @@ impl Store {
         Ok(job)
     }
     pub async fn review(&self, id: &str) -> Result<Option<Review>> {
-        Ok(sqlx::query_as("SELECT job_id,outcome,note,reviewed_at FROM job_reviews WHERE job_id=?")
-            .bind(id).fetch_optional(&self.pool).await?)
+        Ok(
+            sqlx::query_as(
+                "SELECT job_id,outcome,note,reviewed_at FROM job_reviews WHERE job_id=?",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?,
+        )
     }
     pub async fn claim(&self, client: &Client, credential: &str, time: i64) -> Result<Option<Job>> {
         let mut tx = self.pool.begin().await?;
@@ -343,19 +526,33 @@ impl Store {
         let job: Option<Job> = if row.status == "idle" {
             sqlx::query_as("SELECT * FROM jobs WHERE session_id=? AND state='queued' AND NOT EXISTS (SELECT 1 FROM jobs AS active WHERE active.session_id=jobs.session_id AND active.state IN ('claimed','submitted','uncertain')) ORDER BY created,id LIMIT 1")
                 .bind(&client.session_id).fetch_optional(&mut *tx).await?
-        } else { None };
+        } else {
+            None
+        };
         let job = if let Some(job) = job {
             sqlx::query("UPDATE jobs SET state='claimed',worker=?,epoch=?,updated=? WHERE id=? AND state='queued'")
                 .bind(&client.worker).bind(client.epoch).bind(time).bind(&job.id)
                 .execute(&mut *tx).await?;
             Some(Self::job_tx(&mut tx, &job.id).await?)
-        } else { None };
+        } else {
+            None
+        };
         tx.commit().await?;
         Ok(job)
     }
-    pub async fn claim_wait(&self, client: &Client, credential: &str, wait_ms: u64) -> Result<Option<Job>> {
-        if wait_ms > MAX_WAIT_MS { return Err(Error::Invalid("wait_ms")); }
-        let _permit = self.waiters.clone().try_acquire_owned()
+    pub async fn claim_wait(
+        &self,
+        client: &Client,
+        credential: &str,
+        wait_ms: u64,
+    ) -> Result<Option<Job>> {
+        if wait_ms > MAX_WAIT_MS {
+            return Err(Error::Invalid("wait_ms"));
+        }
+        let _permit = self
+            .waiters
+            .clone()
+            .try_acquire_owned()
             .map_err(|_| Error::Conflict("too many waiters"))?;
         // Subscribe BEFORE checking the queue, avoiding lost notifications.
         let signal = self.session_signal(&client.session_id);
@@ -368,34 +565,65 @@ impl Store {
             if let Some(job) = self.claim(client, credential, now()).await? {
                 return Ok(Some(job));
             }
-            if Instant::now() >= deadline { return Ok(None); }
-            if tokio::time::timeout_at(deadline, changes.changed()).await.is_err() {
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            if tokio::time::timeout_at(deadline, changes.changed())
+                .await
+                .is_err()
+            {
                 return self.claim(client, credential, now()).await;
             }
         }
     }
-    pub async fn ack(&self, client: &Client, credential: &str, id: &str, target: &str, result: &str, time: i64) -> Result<Job> {
-        if result.len() > MAX_RESULT { return Err(Error::Invalid("result too long")); }
+    pub async fn ack(
+        &self,
+        client: &Client,
+        credential: &str,
+        id: &str,
+        target: &str,
+        result: &str,
+        time: i64,
+    ) -> Result<Job> {
+        if result.len() > MAX_RESULT {
+            return Err(Error::Invalid("result too long"));
+        }
         let mut tx = self.pool.begin().await?;
         let row = Self::authenticate(&mut tx, client, credential).await?;
         Self::require_lease(&row, client, time)?;
         let job = Self::job_tx(&mut tx, id).await?;
-        if job.session_id != client.session_id || job.worker.as_deref() != Some(client.worker.as_str()) || job.epoch != Some(client.epoch) {
+        if job.session_id != client.session_id
+            || job.worker.as_deref() != Some(client.worker.as_str())
+            || job.epoch != Some(client.epoch)
+        {
             return Err(Error::Unauthorized);
         }
         if !result.is_empty() && (!row.export_allowed || target != "completed") {
             return Err(Error::Conflict("result export not permitted"));
         }
-        if job.state == target && matches!(target, "submitted" | "completed" | "failed" | "uncertain") {
-            if job.result != result { return Err(Error::Conflict("ack payload conflict")); }
+        if job.state == target
+            && matches!(target, "submitted" | "completed" | "failed" | "uncertain")
+        {
+            if job.result != result {
+                return Err(Error::Conflict("ack payload conflict"));
+            }
             tx.commit().await?;
             return Ok(job);
         }
-        if !matches!((job.state.as_str(), target), ("claimed", "submitted" | "failed" | "uncertain") | ("submitted", "completed" | "uncertain")) {
+        if !matches!(
+            (job.state.as_str(), target),
+            ("claimed", "submitted" | "failed" | "uncertain")
+                | ("submitted", "completed" | "uncertain")
+        ) {
             return Err(Error::Conflict("invalid state transition"));
         }
         sqlx::query("UPDATE jobs SET state=?,result=?,updated=? WHERE id=?")
-            .bind(target).bind(result).bind(time).bind(id).execute(&mut *tx).await?;
+            .bind(target)
+            .bind(result)
+            .bind(time)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         let job = Self::job_tx(&mut tx, id).await?;
         tx.commit().await?;
         self.notify_change(&client.session_id);
@@ -407,104 +635,199 @@ impl Store {
 mod tests {
     use super::*;
     async fn fixture(export: bool) -> (Store, Enrollment, Client) {
-        let store = Store::connect(SqliteConnectOptions::new().in_memory(true).foreign_keys(true)).await.unwrap();
-        let enrolled = store.enroll("chat-test", "test", export, 100).await.unwrap();
-        let mut client = Client { session_id: enrolled.session.id.clone(), chat_id: "chat-test".into(), worker: "tab-a".into(), epoch: 0 };
-        client.epoch = store.heartbeat(&client, &enrolled.credential, "idle", 100).await.unwrap().epoch;
+        let store = Store::connect(
+            SqliteConnectOptions::new()
+                .in_memory(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+        let enrolled = store
+            .enroll("chat-test", "test", export, 100)
+            .await
+            .unwrap();
+        let mut client = Client {
+            session_id: enrolled.session.id.clone(),
+            chat_id: "chat-test".into(),
+            worker: "tab-a".into(),
+            epoch: 0,
+        };
+        client.epoch = store
+            .heartbeat(&client, &enrolled.credential, "idle", 100)
+            .await
+            .unwrap()
+            .epoch;
         (store, enrolled, client)
     }
     #[tokio::test]
     async fn idempotency_and_one_claim() {
         let (s, e, c) = fixture(false).await;
-        let a = s.enqueue("r1", &c.session_id, "test", 600, 101).await.unwrap();
-        let b = s.enqueue("r1", &c.session_id, "test", 600, 102).await.unwrap();
-        assert_eq!(a.created,b.created);
-        assert!(s.enqueue("r1", &c.session_id, "different", 600, 103).await.is_err());
-        s.enqueue("r2", &c.session_id, "test2", 600, 103).await.unwrap();
-        let (a,b) = tokio::join!(s.claim(&c,&e.credential,104),s.claim(&c,&e.credential,104));
-        assert_eq!((a.unwrap().is_some() as usize) + (b.unwrap().is_some() as usize),1);
-        s.ack(&c,&e.credential,"r1","submitted","",105).await.unwrap();
-        s.ack(&c,&e.credential,"r1","completed","",106).await.unwrap();
-        assert_eq!(s.claim(&c,&e.credential,107).await.unwrap().unwrap().id,"r2");
+        let a = s
+            .enqueue("r1", &c.session_id, "test", 600, 101)
+            .await
+            .unwrap();
+        let b = s
+            .enqueue("r1", &c.session_id, "test", 600, 102)
+            .await
+            .unwrap();
+        assert_eq!(a.created, b.created);
+        assert!(s
+            .enqueue("r1", &c.session_id, "different", 600, 103)
+            .await
+            .is_err());
+        s.enqueue("r2", &c.session_id, "test2", 600, 103)
+            .await
+            .unwrap();
+        let (a, b) = tokio::join!(
+            s.claim(&c, &e.credential, 104),
+            s.claim(&c, &e.credential, 104)
+        );
+        assert_eq!(
+            (a.unwrap().is_some() as usize) + (b.unwrap().is_some() as usize),
+            1
+        );
+        s.ack(&c, &e.credential, "r1", "submitted", "", 105)
+            .await
+            .unwrap();
+        s.ack(&c, &e.credential, "r1", "completed", "", 106)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.claim(&c, &e.credential, 107).await.unwrap().unwrap().id,
+            "r2"
+        );
     }
     #[tokio::test]
     async fn lease_expiration_fences_old_worker_and_blocks_uncertain_job() {
-        let (s,e,c) = fixture(false).await;
-        s.enqueue("r1",&c.session_id,"test",600,101).await.unwrap();
-        s.claim(&c,&e.credential,102).await.unwrap().unwrap();
-        let mut other = c.clone(); other.worker = "tab-b".into();
-        assert!(s.heartbeat(&other,&e.credential,"idle",103).await.is_err());
-        other.epoch = s.heartbeat(&other,&e.credential,"idle",146).await.unwrap().epoch;
-        assert!(s.ack(&c,&e.credential,"r1","submitted","",147).await.is_err());
-        assert_eq!(s.job("r1",147).await.unwrap().state,"uncertain");
-        assert!(s.claim(&other,&e.credential,147).await.unwrap().is_none());
+        let (s, e, c) = fixture(false).await;
+        s.enqueue("r1", &c.session_id, "test", 600, 101)
+            .await
+            .unwrap();
+        s.claim(&c, &e.credential, 102).await.unwrap().unwrap();
+        let mut other = c.clone();
+        other.worker = "tab-b".into();
+        assert!(s
+            .heartbeat(&other, &e.credential, "idle", 103)
+            .await
+            .is_err());
+        other.epoch = s
+            .heartbeat(&other, &e.credential, "idle", 146)
+            .await
+            .unwrap()
+            .epoch;
+        assert!(s
+            .ack(&c, &e.credential, "r1", "submitted", "", 147)
+            .await
+            .is_err());
+        assert_eq!(s.job("r1", 147).await.unwrap().state, "uncertain");
+        assert!(s.claim(&other, &e.credential, 147).await.unwrap().is_none());
     }
     #[tokio::test]
     async fn authorization_and_export_scope() {
-        let (s,e,c) = fixture(false).await;
-        let mut wrong = c.clone(); wrong.chat_id = "other-chat".into();
-        assert!(matches!(s.claim(&wrong,&e.credential,101).await,Err(Error::Unauthorized)));
-        assert!(matches!(s.claim(&c,"invalid",101).await,Err(Error::Unauthorized)));
-        s.enqueue("r1",&c.session_id,"test",600,101).await.unwrap();
-        s.claim(&c,&e.credential,102).await.unwrap();
-        s.ack(&c,&e.credential,"r1","submitted","",103).await.unwrap();
-        assert!(s.ack(&c,&e.credential,"r1","completed","sample answer",104).await.is_err());
-        s.revoke(&c.session_id,105).await.unwrap();
-        assert!(s.heartbeat(&c,&e.credential,"idle",106).await.is_err());
-        assert_eq!(s.job("r1",106).await.unwrap().state,"uncertain");
+        let (s, e, c) = fixture(false).await;
+        let mut wrong = c.clone();
+        wrong.chat_id = "other-chat".into();
+        assert!(matches!(
+            s.claim(&wrong, &e.credential, 101).await,
+            Err(Error::Unauthorized)
+        ));
+        assert!(matches!(
+            s.claim(&c, "invalid", 101).await,
+            Err(Error::Unauthorized)
+        ));
+        s.enqueue("r1", &c.session_id, "test", 600, 101)
+            .await
+            .unwrap();
+        s.claim(&c, &e.credential, 102).await.unwrap();
+        s.ack(&c, &e.credential, "r1", "submitted", "", 103)
+            .await
+            .unwrap();
+        assert!(s
+            .ack(&c, &e.credential, "r1", "completed", "sample answer", 104)
+            .await
+            .is_err());
+        s.revoke(&c.session_id, 105).await.unwrap();
+        assert!(s.heartbeat(&c, &e.credential, "idle", 106).await.is_err());
+        assert_eq!(s.job("r1", 106).await.unwrap().state, "uncertain");
     }
     async fn live_fixture() -> (Store, Enrollment, Client) {
-        let s = Store::connect(SqliteConnectOptions::new().in_memory(true).foreign_keys(true)).await.unwrap();
+        let s = Store::connect(
+            SqliteConnectOptions::new()
+                .in_memory(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
         let e = s.enroll("chat-wait", "test", false, now()).await.unwrap();
-        let mut c = Client { session_id:e.session.id.clone(), chat_id:"chat-wait".into(), worker:"tab-a".into(), epoch:0 };
-        c.epoch = s.heartbeat(&c,&e.credential,"idle",now()).await.unwrap().epoch;
-        (s,e,c)
+        let mut c = Client {
+            session_id: e.session.id.clone(),
+            chat_id: "chat-wait".into(),
+            worker: "tab-a".into(),
+            epoch: 0,
+        };
+        c.epoch = s
+            .heartbeat(&c, &e.credential, "idle", now())
+            .await
+            .unwrap()
+            .epoch;
+        (s, e, c)
     }
     #[tokio::test]
     async fn wait_wakes_on_enqueue_without_holding_database() {
-        let (s,e,c) = live_fixture().await;
+        let (s, e, c) = live_fixture().await;
         let producer = async {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            s.enqueue("r1",&c.session_id,"test",600,now()).await.unwrap();
+            s.enqueue("r1", &c.session_id, "test", 600, now())
+                .await
+                .unwrap();
         };
         let (job, ()) = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::join!(s.claim_wait(&c,&e.credential,2500),producer)
-        }).await.unwrap();
-        assert_eq!(job.unwrap().unwrap().id,"r1");
-        assert!(s.claim_wait(&c,&e.credential,0).await.unwrap().is_none());
+            tokio::join!(s.claim_wait(&c, &e.credential, 2500), producer)
+        })
+        .await
+        .unwrap();
+        assert_eq!(job.unwrap().unwrap().id, "r1");
+        assert!(s.claim_wait(&c, &e.credential, 0).await.unwrap().is_none());
     }
     #[tokio::test]
     async fn wait_timeout_and_revocation() {
-        let (s,e,c) = live_fixture().await;
-        assert!(s.claim_wait(&c,&e.credential,20).await.unwrap().is_none());
-        assert!(matches!(s.claim_wait(&c,&e.credential,MAX_WAIT_MS+1).await,Err(Error::Invalid(_))));
+        let (s, e, c) = live_fixture().await;
+        assert!(s.claim_wait(&c, &e.credential, 20).await.unwrap().is_none());
+        assert!(matches!(
+            s.claim_wait(&c, &e.credential, MAX_WAIT_MS + 1).await,
+            Err(Error::Invalid(_))
+        ));
         let revoke = async {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            s.revoke(&c.session_id,now()).await.unwrap();
+            s.revoke(&c.session_id, now()).await.unwrap();
         };
-        let (job, ()) = tokio::join!(s.claim_wait(&c,&e.credential,1000),revoke);
-        assert!(matches!(job,Err(Error::Unauthorized)));
+        let (job, ()) = tokio::join!(s.claim_wait(&c, &e.credential, 1000), revoke);
+        assert!(matches!(job, Err(Error::Unauthorized)));
     }
     #[tokio::test]
     async fn wait_wakes_when_session_becomes_idle() {
-        let (s,e,c) = live_fixture().await;
-        s.heartbeat(&c,&e.credential,"busy",now()).await.unwrap();
-        s.enqueue("r1",&c.session_id,"test",600,now()).await.unwrap();
+        let (s, e, c) = live_fixture().await;
+        s.heartbeat(&c, &e.credential, "busy", now()).await.unwrap();
+        s.enqueue("r1", &c.session_id, "test", 600, now())
+            .await
+            .unwrap();
         let idle = async {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            s.heartbeat(&c,&e.credential,"idle",now()).await.unwrap();
+            s.heartbeat(&c, &e.credential, "idle", now()).await.unwrap();
         };
-        let (job, ()) = tokio::join!(s.claim_wait(&c,&e.credential,1000),idle);
-        assert_eq!(job.unwrap().unwrap().id,"r1");
+        let (job, ()) = tokio::join!(s.claim_wait(&c, &e.credential, 1000), idle);
+        assert_eq!(job.unwrap().unwrap().id, "r1");
     }
     #[tokio::test]
     async fn notifications_are_targeted_and_abandoned_signals_do_not_accumulate() {
-        let (s,_,c) = fixture(false).await;
+        let (s, _, c) = fixture(false).await;
         let a = s.session_signal(&c.session_id);
         let b = s.session_signal("other");
         let a_rx = a.subscribe();
         let b_rx = b.subscribe();
-        s.enqueue("r1",&c.session_id,"test",600,101).await.unwrap();
+        s.enqueue("r1", &c.session_id, "test", 600, 101)
+            .await
+            .unwrap();
         assert!(a_rx.has_changed().unwrap());
         assert!(!b_rx.has_changed().unwrap());
         drop(b_rx);
@@ -514,47 +837,83 @@ mod tests {
     }
     #[tokio::test]
     async fn registry_cursor_is_stable_and_complete() {
-        let (s,e,c) = fixture(false).await;
-        s.enroll("chat2","test2",false,100).await.unwrap();
-        s.enroll("chat3","test3",false,100).await.unwrap();
-        let first = s.list_page("",1,100).await.unwrap();
+        let (s, e, c) = fixture(false).await;
+        s.enroll("chat2", "test2", false, 100).await.unwrap();
+        s.enroll("chat3", "test3", false, 100).await.unwrap();
+        let first = s.list_page("", 1, 100).await.unwrap();
         let cursor = first.next_after.unwrap();
-        assert_eq!(first.sessions[0].id,cursor);
-        s.heartbeat(&c,&e.credential,"busy",101).await.unwrap();
-        let second = s.list_page(&cursor,2,101).await.unwrap();
-        assert_eq!(second.sessions.len(),2);
-        assert!(second.sessions.iter().all(|row| row.id.as_str() > cursor.as_str()));
+        assert_eq!(first.sessions[0].id, cursor);
+        s.heartbeat(&c, &e.credential, "busy", 101).await.unwrap();
+        let second = s.list_page(&cursor, 2, 101).await.unwrap();
+        assert_eq!(second.sessions.len(), 2);
+        assert!(second
+            .sessions
+            .iter()
+            .all(|row| row.id.as_str() > cursor.as_str()));
         assert!(second.next_after.is_none());
-        assert!(s.list_page("",0,101).await.is_err());
+        assert!(s.list_page("", 0, 101).await.is_err());
     }
     #[tokio::test]
     async fn observer_reads_only_metadata_without_updating_durable_state() {
-        let (s,_,c) = fixture(false).await;
-        s.enqueue("r1",&c.session_id,"private fixture",1,101).await.unwrap();
-        let status = s.observe_job("r1",103).await.unwrap();
-        assert_eq!(status.state,"expired");
-        assert!(!serde_json::to_string(&status).unwrap().contains("private fixture"));
+        let (s, _, c) = fixture(false).await;
+        s.enqueue("r1", &c.session_id, "private fixture", 1, 101)
+            .await
+            .unwrap();
+        let status = s.observe_job("r1", 103).await.unwrap();
+        assert_eq!(status.state, "expired");
+        assert!(!serde_json::to_string(&status)
+            .unwrap()
+            .contains("private fixture"));
         let mut tx = s.pool.begin().await.unwrap();
-        assert_eq!(Store::job_tx(&mut tx,"r1").await.unwrap().state,"queued");
+        assert_eq!(Store::job_tx(&mut tx, "r1").await.unwrap().state, "queued");
         tx.commit().await.unwrap();
     }
     #[tokio::test]
     async fn operator_review_requires_expired_lease_and_never_requeues() {
-        let (s,e,mut c) = fixture(false).await;
-        s.enqueue("r1",&c.session_id,"test",600,101).await.unwrap();
-        s.enqueue("r2",&c.session_id,"next",600,102).await.unwrap();
-        s.claim(&c,&e.credential,103).await.unwrap().unwrap();
-        assert!(s.resolve("r1","failed","verified",104).await.is_err());
-        assert!(s.resolve("r1","queued","verified",146).await.is_err());
-        assert!(s.resolve("r1","failed","",146).await.is_err());
-        assert_eq!(s.resolve("r1","failed","verified not submitted",146).await.unwrap().state,"failed");
+        let (s, e, mut c) = fixture(false).await;
+        s.enqueue("r1", &c.session_id, "test", 600, 101)
+            .await
+            .unwrap();
+        s.enqueue("r2", &c.session_id, "next", 600, 102)
+            .await
+            .unwrap();
+        s.claim(&c, &e.credential, 103).await.unwrap().unwrap();
+        assert!(s.resolve("r1", "failed", "verified", 104).await.is_err());
+        assert!(s.resolve("r1", "queued", "verified", 146).await.is_err());
+        assert!(s.resolve("r1", "failed", "", 146).await.is_err());
+        assert_eq!(
+            s.resolve("r1", "failed", "verified not submitted", 146)
+                .await
+                .unwrap()
+                .state,
+            "failed"
+        );
         let review = s.review("r1").await.unwrap().unwrap();
-        assert_eq!(review.reviewed_at,146);
-        assert_eq!(s.resolve("r1","failed","verified not submitted",147).await.unwrap().updated,146);
-        assert!(s.resolve("r1","completed","different",148).await.is_err());
-        assert!(s.ack(&c,&e.credential,"r1","submitted","",148).await.is_err());
-        c.epoch = s.heartbeat(&c,&e.credential,"idle",149).await.unwrap().epoch;
-        assert_eq!(s.claim(&c,&e.credential,150).await.unwrap().unwrap().id,"r2");
+        assert_eq!(review.reviewed_at, 146);
+        assert_eq!(
+            s.resolve("r1", "failed", "verified not submitted", 147)
+                .await
+                .unwrap()
+                .updated,
+            146
+        );
+        assert!(s
+            .resolve("r1", "completed", "different", 148)
+            .await
+            .is_err());
+        assert!(s
+            .ack(&c, &e.credential, "r1", "submitted", "", 148)
+            .await
+            .is_err());
+        c.epoch = s
+            .heartbeat(&c, &e.credential, "idle", 149)
+            .await
+            .unwrap()
+            .epoch;
+        assert_eq!(
+            s.claim(&c, &e.credential, 150).await.unwrap().unwrap().id,
+            "r2"
+        );
     }
     #[tokio::test]
     async fn disk_restart_preserves_queue_and_invalidates_lease() {
@@ -564,19 +923,39 @@ mod tests {
         let s = Store::open(&path).await.unwrap();
         let t = now();
         let e = s.enroll("chat-restart", "test", false, t).await.unwrap();
-        let mut c = Client { session_id:e.session.id.clone(), chat_id:"chat-restart".into(), worker:"tab-a".into(), epoch:0 };
-        c.epoch = s.heartbeat(&c, &e.credential, "idle", t).await.unwrap().epoch;
-        s.enqueue("first", &c.session_id, "test", 600, t).await.unwrap();
-        s.enqueue("second", &c.session_id, "test", 600, t+1).await.unwrap();
-        s.claim(&c, &e.credential, t+2).await.unwrap().unwrap();
+        let mut c = Client {
+            session_id: e.session.id.clone(),
+            chat_id: "chat-restart".into(),
+            worker: "tab-a".into(),
+            epoch: 0,
+        };
+        c.epoch = s
+            .heartbeat(&c, &e.credential, "idle", t)
+            .await
+            .unwrap()
+            .epoch;
+        s.enqueue("first", &c.session_id, "test", 600, t)
+            .await
+            .unwrap();
+        s.enqueue("second", &c.session_id, "test", 600, t + 1)
+            .await
+            .unwrap();
+        s.claim(&c, &e.credential, t + 2).await.unwrap().unwrap();
         s.pool.close().await;
         drop(s);
         let s = Store::open(&path).await.unwrap();
         assert_eq!(s.job("first", now()).await.unwrap().state, "uncertain");
         assert_eq!(s.job("second", now()).await.unwrap().state, "queued");
-        assert!(s.ack(&c, &e.credential, "first", "submitted", "", now()).await.is_err());
+        assert!(s
+            .ack(&c, &e.credential, "first", "submitted", "", now())
+            .await
+            .is_err());
         assert!(!s.list(now()).await.unwrap()[0].online);
-        c.epoch = s.heartbeat(&c, &e.credential, "idle", now()).await.unwrap().epoch;
+        c.epoch = s
+            .heartbeat(&c, &e.credential, "idle", now())
+            .await
+            .unwrap()
+            .epoch;
         assert!(s.claim(&c, &e.credential, now()).await.unwrap().is_none());
         s.pool.close().await;
         drop(s);
@@ -584,17 +963,39 @@ mod tests {
     }
     #[tokio::test]
     async fn expiry_cancel_and_ack_replay() {
-        let (s,e,c) = fixture(true).await;
-        s.enqueue("expired",&c.session_id,"test",1,101).await.unwrap();
-        assert_eq!(s.job("expired",102).await.unwrap().state,"expired");
-        s.enqueue("cancel",&c.session_id,"test",600,102).await.unwrap();
-        assert_eq!(s.cancel("cancel",103).await.unwrap().state,"canceled");
-        s.enqueue("r1",&c.session_id,"test",600,104).await.unwrap();
-        assert_eq!(s.claim(&c,&e.credential,105).await.unwrap().unwrap().id,"r1");
-        assert!(s.cancel("r1",106).await.is_err());
-        s.ack(&c,&e.credential,"r1","submitted","",106).await.unwrap();
-        s.ack(&c,&e.credential,"r1","completed","answer",107).await.unwrap();
-        assert_eq!(s.ack(&c,&e.credential,"r1","completed","answer",108).await.unwrap().updated,107);
-        assert!(s.ack(&c,&e.credential,"r1","completed","different",109).await.is_err());
+        let (s, e, c) = fixture(true).await;
+        s.enqueue("expired", &c.session_id, "test", 1, 101)
+            .await
+            .unwrap();
+        assert_eq!(s.job("expired", 102).await.unwrap().state, "expired");
+        s.enqueue("cancel", &c.session_id, "test", 600, 102)
+            .await
+            .unwrap();
+        assert_eq!(s.cancel("cancel", 103).await.unwrap().state, "canceled");
+        s.enqueue("r1", &c.session_id, "test", 600, 104)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.claim(&c, &e.credential, 105).await.unwrap().unwrap().id,
+            "r1"
+        );
+        assert!(s.cancel("r1", 106).await.is_err());
+        s.ack(&c, &e.credential, "r1", "submitted", "", 106)
+            .await
+            .unwrap();
+        s.ack(&c, &e.credential, "r1", "completed", "answer", 107)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.ack(&c, &e.credential, "r1", "completed", "answer", 108)
+                .await
+                .unwrap()
+                .updated,
+            107
+        );
+        assert!(s
+            .ack(&c, &e.credential, "r1", "completed", "different", 109)
+            .await
+            .is_err());
     }
 }
