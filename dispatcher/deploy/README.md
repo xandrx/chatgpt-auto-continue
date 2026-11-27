@@ -10,7 +10,7 @@ Deployment status (2026-11-27): **backend running** on the existing Debian 10 VP
 - Exact extension Origin authorization is configured only after the installed browser extension ID is known.
 - Admin, observer and MCP operator tokens are distinct random secrets in `/etc/csd/dispatcher.env`; the file is root-owned and readable only by the service group.
 - SQLite is stored under `/var/lib/csd`; service runs as an unprivileged `csd` account.
-- Never enable remote tasks for a real conversation until the browser E2E matrix in `docs/DISPATCHER-EXTENSION-E2E.md` has passed.
+- A limited live pilot is allowed only for one user-selected real conversation and one explicitly approved harmless prompt; keep every other chat disabled. Multi-chat/unattended operation remains gated on the browser E2E matrix in `docs/DISPATCHER-EXTENSION-E2E.md`.
 
 ## Files
 
