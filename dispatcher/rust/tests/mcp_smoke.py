@@ -141,7 +141,8 @@ def run(binary):
                              "params": {"name": "confirm_task", "arguments": {
                                  "approval_id": prepared["approval_id"], "user_confirmed": False}}},
                             operator, operator_session, operator_version, path="/mcp/operator")
-            assert denied["result"].get("isError") is True
+            assert "error" in denied and "result" not in denied, denied
+            request("GET", "/v1/jobs/" + prepared["request_id"], admin, expected=404)
             confirmed, _ = rpc({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
                                 "params": {"name": "confirm_task", "arguments": {
                                     "approval_id": prepared["approval_id"], "user_confirmed": True}}},
