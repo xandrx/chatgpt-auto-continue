@@ -1,4 +1,4 @@
-const API_BASE = 'http://127.0.0.1:8766';
+const API_BASE = 'https://csd.guddom.com';
 const SESSIONS_KEY = 'csd_sessions_v1';
 const ENABLED_KEY = 'csd_remote_enabled_v1';
 

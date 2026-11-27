@@ -1,0 +1,34 @@
+[Unit]
+Description=ChatGPT Session Dispatcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=csd
+Group=csd
+EnvironmentFile=/etc/csd/dispatcher.env
+Environment=DISPATCHER_DB=/var/lib/csd/dispatcher.sqlite3
+WorkingDirectory=/var/lib/csd
+ExecStart=/opt/csd/chatgpt-session-dispatcher
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/csd
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LimitNOFILE=4096
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

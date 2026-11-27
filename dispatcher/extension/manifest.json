@@ -2,11 +2,11 @@
   "manifest_version": 3,
   "name": "ChatGPT Session Dispatcher",
   "version": "0.1.0",
-  "description": "Explicitly connect selected ChatGPT conversations to a private local task dispatcher.",
+  "description": "Explicitly connect selected ChatGPT conversations to a private HTTPS task dispatcher.",
   "permissions": ["storage", "activeTab"],
   "host_permissions": [
     "https://chatgpt.com/*",
-    "http://127.0.0.1:8766/*"
+    "https://csd.guddom.com/*"
   ],
   "background": {
     "service_worker": "background.js"
