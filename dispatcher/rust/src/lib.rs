@@ -574,7 +574,7 @@ impl Store {
         self.notify_change(&row.session_id);
         Ok(job.into())
     }
-    pub async fn cancel_prepared_task(&self, approval_id: &str) -> Result<()> {
+    pub async fn cancel_prepared_task(&self, approval_id: &str) -> Result<String> {
         validate(approval_id, 64, "approval_id")?;
         let mut tx = self.pool.begin().await?;
         let state: Option<String> =
@@ -582,21 +582,23 @@ impl Store {
                 .bind(approval_id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        match state.as_deref() {
+        let final_state = match state.as_deref() {
             Some("pending") => {
                 sqlx::query("UPDATE mcp_approvals SET state='canceled',prompt='' WHERE id=? AND state='pending'")
                     .bind(approval_id).execute(&mut *tx).await?;
+                "canceled"
             }
-            Some("canceled") | Some("expired") => {}
+            Some("canceled") => "canceled",
+            Some("expired") => "expired",
             Some("queued") => {
                 return Err(Error::Conflict(
                     "task already queued; cancel the queued job instead",
                 ))
             }
             _ => return Err(Error::NotFound),
-        }
+        };
         tx.commit().await?;
-        Ok(())
+        Ok(final_state.to_owned())
     }
     pub async fn cancel(&self, id: &str, time: i64) -> Result<Job> {
         let mut tx = self.pool.begin().await?;
@@ -1050,8 +1052,14 @@ mod tests {
             .prepare_task(&c.session_id, "cancel me", 600, 100)
             .await
             .unwrap();
-        s.cancel_prepared_task(&canceled.id).await.unwrap();
-        s.cancel_prepared_task(&canceled.id).await.unwrap();
+        assert_eq!(
+            s.cancel_prepared_task(&canceled.id).await.unwrap(),
+            "canceled"
+        );
+        assert_eq!(
+            s.cancel_prepared_task(&canceled.id).await.unwrap(),
+            "canceled"
+        );
         assert!(s.confirm_task(&canceled.id, 101).await.is_err());
         let stored: String = sqlx::query_scalar("SELECT prompt FROM mcp_approvals WHERE id=?")
             .bind(&canceled.id)
@@ -1071,6 +1079,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, "expired");
+        assert_eq!(
+            s.cancel_prepared_task(&expired.id).await.unwrap(),
+            "expired"
+        );
 
         let revoked = s
             .prepare_task(&c.session_id, "do not send", 600, 400)

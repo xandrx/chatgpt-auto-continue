@@ -124,7 +124,7 @@ struct PreparedResponse {
 #[derive(Serialize)]
 struct Canceled {
     approval_id: String,
-    state: &'static str,
+    state: String,
 }
 
 #[tool_router(server_handler)]
@@ -221,13 +221,14 @@ impl Operator {
         &self,
         Parameters(req): Parameters<CancelRequest>,
     ) -> Result<String, McpError> {
-        self.store
+        let state = self
+            .store
             .cancel_prepared_task(&req.approval_id)
             .await
             .map_err(map_store_error)?;
         serialize(&Canceled {
             approval_id: req.approval_id,
-            state: "canceled",
+            state,
         })
     }
 }

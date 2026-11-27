@@ -113,6 +113,7 @@ def run(binary):
             text = result["result"]["content"][0]["text"]
             assert "synthetic private payload" not in text
             assert json.loads(text)["state"] == "queued"
+            request("POST", "/v1/jobs/mcp-job/cancel", admin, {})
 
             # Operator MCP is a separate credential and uses a two-phase queue.
             operator_init, operator_session = rpc(initialize, operator, path="/mcp/operator")
@@ -129,6 +130,7 @@ def run(binary):
                                     "params": {"name": "prepare_task", "arguments": {
                                         "session_id": sid, "prompt": "approved fixture task", "ttl_seconds": 600}}},
                                    operator, operator_session, operator_version, path="/mcp/operator")
+            assert "result" in prepared_call, f"prepare_task RPC error: {prepared_call}"
             assert not prepared_call["result"].get("isError"), prepared_call
             prepared = json.loads(prepared_call["result"]["content"][0]["text"])
             assert prepared["requires_explicit_user_confirmation"] is True
