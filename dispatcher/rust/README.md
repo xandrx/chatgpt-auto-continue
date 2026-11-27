@@ -13,8 +13,10 @@ Development status: Linux CI successfully built the release binary and passed al
 
 Set DISPATCHER_ADMIN_TOKEN to a randomly generated value of at least 32 characters through the process environment; never commit it or use a shared sample credential. Optionally set DISPATCHER_DB (default dispatcher.sqlite3). The service binds exclusively to 127.0.0.1:8766.
 
-API v1: GET /health; POST /v1/sessions (operator enrollment); GET /v1/sessions (operator list); POST /v1/sessions/{id}/revoke (operator); POST /v1/jobs (operator enqueue); GET /v1/jobs/{id}; POST /v1/jobs/{id}/cancel; POST /v1/sessions/{id}/heartbeat, /claim, /ack (session credential). Use Authorization: Bearer <credential>. Enrollment returns a unique session credential only once. Session actions must match the enrolled chat ID and worker; claim/ack require the current lease epoch.
+API v1: GET /health; POST /v1/sessions (operator enrollment); GET /v1/sessions (operator list); POST /v1/sessions/{id}/revoke (operator); POST /v1/jobs (operator enqueue); GET /v1/jobs/{id}; POST /v1/jobs/{id}/cancel; POST /v1/sessions/{id}/heartbeat, /claim, /wait, /ack (session credential). Use Authorization: Bearer <credential>. Enrollment returns a unique session credential only once. Session actions must match the enrolled chat ID and worker; claim/ack require the current lease epoch.
 
 No server-side action executes a task; it stores authorized text for an opted-in client. A claim is not evidence of delivery. Uncertain work blocks further delivery until reviewed (manual recovery endpoint is a future milestone). Server restart invalidates all previous leases, marks in-flight work uncertain, and retains unexpired queued work. Export disabled by default. Do not expose the development endpoint to the internet.
 
-Tests exercise storage and state transitions without real ChatGPT, using an in-memory database. Follow docs/DISPATCHER-PLAN.md before integrating live clients.
+Long polling uses a bounded wait of up to 25 seconds with coalesced wake-up events and at most 256 pending requests; SQLite is released during the wait. See docs/DISPATCHER-PROTOCOL.md for details.
+
+Tests exercise storage and state transitions without real ChatGPT, using an in-memory database. The CI additionally runs a synthetic HTTP smoke test against the actual release binary in an isolated runner. Follow docs/DISPATCHER-PLAN.md before integrating live clients.

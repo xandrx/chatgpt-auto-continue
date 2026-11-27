@@ -63,6 +63,9 @@ struct Enqueue { request_id: String, session_id: String, prompt: String, ttl_sec
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClientRequest { chat_id: String, worker: String, epoch: i64 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitRequest { chat_id: String, worker: String, epoch: i64, wait_ms: u64 }
 impl ClientRequest {
     fn client(self, session_id: String) -> Client {
         Client { session_id, chat_id: self.chat_id, worker: self.worker, epoch: self.epoch }
@@ -109,6 +112,10 @@ async fn heartbeat(State(app): State<App>, Path(id): Path<String>, headers: Head
 async fn claim(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, Json(req): Json<ClientRequest>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({"job":app.store.claim(&req.client(id), bearer(&headers)?, now()).await?})))
 }
+async fn wait(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, Json(req): Json<WaitRequest>) -> ApiResult<Json<Value>> {
+    let client = Client { session_id:id, chat_id:req.chat_id, worker:req.worker, epoch:req.epoch };
+    Ok(Json(json!({"job":app.store.claim_wait(&client, bearer(&headers)?, req.wait_ms).await?})))
+}
 async fn ack(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, Json(req): Json<Ack>) -> ApiResult<Json<Value>> {
     let client = Client { session_id:id, chat_id:req.chat_id, worker:req.worker, epoch:req.epoch };
     Ok(Json(json!(app.store.ack(&client, bearer(&headers)?, &req.request_id, &req.state, &req.result, now()).await?)))
@@ -120,6 +127,7 @@ fn router(app: App) -> Router {
         .route("/v1/sessions/{id}/revoke", post(revoke))
         .route("/v1/sessions/{id}/heartbeat", post(heartbeat))
         .route("/v1/sessions/{id}/claim", post(claim))
+        .route("/v1/sessions/{id}/wait", post(wait))
         .route("/v1/sessions/{id}/ack", post(ack))
         .route("/v1/jobs", post(enqueue))
         .route("/v1/jobs/{id}", get(job))
@@ -173,7 +181,9 @@ mod tests {
         let epoch = lease["epoch"].as_i64().unwrap();
         let (status, _) = call(&app,"POST","/v1/jobs",Some(&operator_key),json!({"request_id":"r1","session_id":sid,"prompt":"fixture task","ttl_seconds":600})).await;
         assert_eq!(status, StatusCode::OK);
-        let (status, claimed) = call(&app,"POST",&format!("{prefix}/claim"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch})).await;
+        let (status, _) = call(&app,"POST",&format!("{prefix}/wait"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"wait_ms":25001})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, claimed) = call(&app,"POST",&format!("{prefix}/wait"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"wait_ms":100})).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(claimed["job"]["id"],"r1");
         let (status, _) = call(&app,"POST",&format!("{prefix}/ack"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"request_id":"r1","state":"completed"})).await;
@@ -187,6 +197,9 @@ mod tests {
         let (status, job) = call(&app,"GET","/v1/jobs/r1",Some(&operator_key),Value::Null).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(job["state"],"completed");
+        let (status, empty) = call(&app,"POST",&format!("{prefix}/wait"),Some(session_key),json!({"chat_id":"fixture-chat","worker":"test","epoch":epoch,"wait_ms":10})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(empty["job"].is_null());
         drop(app);
         // SQLite's worker may close asynchronously; keep temp cleanup best effort on Windows.
         let _ = std::fs::remove_dir_all(directory);

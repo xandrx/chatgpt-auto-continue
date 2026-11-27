@@ -6,11 +6,15 @@ use sqlx::{
 };
 use std::{path::Path, time::{Duration, SystemTime, UNIX_EPOCH}};
 use subtle::ConstantTimeEq;
+use std::sync::Arc;
+use tokio::{sync::{watch, Semaphore}, time::Instant};
 use uuid::Uuid;
 
 pub const LEASE_SECONDS: i64 = 45;
 pub const MAX_PROMPT: usize = 20_000;
 pub const MAX_RESULT: usize = 40_000;
+pub const MAX_WAIT_MS: u64 = 25_000;
+const MAX_WAITERS: usize = 256;
 
 #[derive(Debug)]
 pub enum Error {
@@ -38,7 +42,11 @@ fn validate(value: &str, max: usize, field: &'static str) -> Result<()> {
 }
 
 #[derive(Clone)]
-pub struct Store { pool: SqlitePool }
+pub struct Store {
+    pool: SqlitePool,
+    changes: watch::Sender<u64>,
+    waiters: Arc<Semaphore>,
+}
 
 #[derive(Debug, FromRow)]
 struct Session {
@@ -88,7 +96,12 @@ impl Store {
         // A single connection serializes this small personal service's transactions.
         let pool = SqlitePoolOptions::new().max_connections(1).connect_with(options).await?;
         sqlx::raw_sql(include_str!("../schema.sql")).execute(&pool).await?;
-        Ok(Self { pool })
+        let (changes, _) = watch::channel(0);
+        Ok(Self { pool, changes, waiters: Arc::new(Semaphore::new(MAX_WAITERS)) })
+    }
+    fn notify_change(&self) {
+        // Coalesce updates; observers always recheck the durable queue.
+        self.changes.send_modify(|revision| *revision = revision.wrapping_add(1));
     }
     // A restarted process cannot attest to delivery in the previous process.
     // Revoke every old lease; keep queued jobs and block ambiguous in-flight jobs.
@@ -156,6 +169,7 @@ impl Store {
         sqlx::query("UPDATE jobs SET state='canceled',updated=? WHERE session_id=? AND state='queued'")
             .bind(time).bind(id).execute(&mut *tx).await?;
         tx.commit().await?;
+        self.notify_change();
         Ok(())
     }
     pub async fn heartbeat(&self, client: &Client, credential: &str, status: &str, time: i64) -> Result<SessionView> {
@@ -176,6 +190,7 @@ impl Store {
             .bind(&client.session_id).execute(&mut *tx).await?;
         let view = Self::session(&mut tx, &client.session_id).await?.view(time);
         tx.commit().await?;
+        if row.status != status || row.epoch != epoch { self.notify_change(); }
         Ok(view)
     }
     pub async fn enqueue(&self, id: &str, session_id: &str, prompt: &str, ttl: i64, time: i64) -> Result<Job> {
@@ -198,6 +213,7 @@ impl Store {
             .execute(&mut *tx).await?;
         let job = Self::job_tx(&mut tx, id).await?;
         tx.commit().await?;
+        self.notify_change();
         Ok(job)
     }
     async fn job_tx(tx: &mut Transaction<'_, Sqlite>, id: &str) -> Result<Job> {
@@ -243,6 +259,26 @@ impl Store {
         tx.commit().await?;
         Ok(job)
     }
+    pub async fn claim_wait(&self, client: &Client, credential: &str, wait_ms: u64) -> Result<Option<Job>> {
+        if wait_ms > MAX_WAIT_MS { return Err(Error::Invalid("wait_ms")); }
+        // Subscribe BEFORE checking the queue, avoiding lost notifications.
+        let mut changes = self.changes.subscribe();
+        let _permit = self.waiters.clone().try_acquire_owned()
+            .map_err(|_| Error::Conflict("too many waiters"))?;
+        let deadline = Instant::now() + Duration::from_millis(wait_ms);
+        loop {
+            // The transaction is committed by claim before awaiting any event.
+            // Every wake-up, including timeout, revalidates credentials and lease.
+            changes.borrow_and_update();
+            if let Some(job) = self.claim(client, credential, now()).await? {
+                return Ok(Some(job));
+            }
+            if Instant::now() >= deadline { return Ok(None); }
+            if tokio::time::timeout_at(deadline, changes.changed()).await.is_err() {
+                return self.claim(client, credential, now()).await;
+            }
+        }
+    }
     pub async fn ack(&self, client: &Client, credential: &str, id: &str, target: &str, result: &str, time: i64) -> Result<Job> {
         if result.len() > MAX_RESULT { return Err(Error::Invalid("result too long")); }
         let mut tx = self.pool.begin().await?;
@@ -267,6 +303,7 @@ impl Store {
             .bind(target).bind(result).bind(time).bind(id).execute(&mut *tx).await?;
         let job = Self::job_tx(&mut tx, id).await?;
         tx.commit().await?;
+        self.notify_change();
         Ok(job)
     }
 }
@@ -320,6 +357,50 @@ mod tests {
         s.revoke(&c.session_id,105).await.unwrap();
         assert!(s.heartbeat(&c,&e.credential,"idle",106).await.is_err());
         assert_eq!(s.job("r1",106).await.unwrap().state,"uncertain");
+    }
+    async fn live_fixture() -> (Store, Enrollment, Client) {
+        let s = Store::connect(SqliteConnectOptions::new().in_memory(true).foreign_keys(true)).await.unwrap();
+        let e = s.enroll("chat-wait", "test", false, now()).await.unwrap();
+        let mut c = Client { session_id:e.session.id.clone(), chat_id:"chat-wait".into(), worker:"tab-a".into(), epoch:0 };
+        c.epoch = s.heartbeat(&c,&e.credential,"idle",now()).await.unwrap().epoch;
+        (s,e,c)
+    }
+    #[tokio::test]
+    async fn wait_wakes_on_enqueue_without_holding_database() {
+        let (s,e,c) = live_fixture().await;
+        let producer = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            s.enqueue("r1",&c.session_id,"test",600,now()).await.unwrap();
+        };
+        let (job, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(s.claim_wait(&c,&e.credential,2500),producer)
+        }).await.unwrap();
+        assert_eq!(job.unwrap().unwrap().id,"r1");
+        assert!(s.claim_wait(&c,&e.credential,0).await.unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn wait_timeout_and_revocation() {
+        let (s,e,c) = live_fixture().await;
+        assert!(s.claim_wait(&c,&e.credential,20).await.unwrap().is_none());
+        assert!(matches!(s.claim_wait(&c,&e.credential,MAX_WAIT_MS+1).await,Err(Error::Invalid(_))));
+        let revoke = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            s.revoke(&c.session_id,now()).await.unwrap();
+        };
+        let (job, ()) = tokio::join!(s.claim_wait(&c,&e.credential,1000),revoke);
+        assert!(matches!(job,Err(Error::Unauthorized)));
+    }
+    #[tokio::test]
+    async fn wait_wakes_when_session_becomes_idle() {
+        let (s,e,c) = live_fixture().await;
+        s.heartbeat(&c,&e.credential,"busy",now()).await.unwrap();
+        s.enqueue("r1",&c.session_id,"test",600,now()).await.unwrap();
+        let idle = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            s.heartbeat(&c,&e.credential,"idle",now()).await.unwrap();
+        };
+        let (job, ()) = tokio::join!(s.claim_wait(&c,&e.credential,1000),idle);
+        assert_eq!(job.unwrap().unwrap().id,"r1");
     }
     #[tokio::test]
     async fn disk_restart_preserves_queue_and_invalidates_lease() {
