@@ -9,7 +9,7 @@ Prerequisites: Rust stable with Cargo, a C toolchain for bundled SQLite (on Wind
     cargo build --release
     cargo run
 
-Development status: source has been saved, but Cargo is not installed on the current workstation. The Rust build and six Rust tests require Cargo or Linux CI; Cargo.lock must be generated and committed after the first successful build. CI is configured to test and build only, not deploy. The separate SQLite schema smoke test passes (run python tests/schema_smoke.py); Python is needed only for this optional development check.
+Development status: Linux CI successfully built the release binary and passed all six Rust tests (run 45994133320, commit ba98b1c8c3a7). Rust and Cargo 1.100.0 are installed on the Windows development workstation. Local MSVC compilation requires the Visual Studio C++ toolchain, which is currently absent. CI is configured to test and build only, not deploy. The separate SQLite schema smoke test passes (run python tests/schema_smoke.py); Python is needed only for this optional development check.
 
 Set DISPATCHER_ADMIN_TOKEN to a randomly generated value of at least 32 characters through the process environment; never commit it or use a shared sample credential. Optionally set DISPATCHER_DB (default dispatcher.sqlite3). The service binds exclusively to 127.0.0.1:8766.
 
