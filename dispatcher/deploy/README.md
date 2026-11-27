@@ -1,6 +1,6 @@
 # VPS deployment — Rust Session Dispatcher
 
-Deployment status (2026-11-27): **backend running** on the existing Debian 10 VPS as an enabled `chatgpt-session-dispatcher.service`, bound only to `127.0.0.1:8766`. The public HTTPS origin is `https://csd.guddom.com`; its Let's Encrypt certificate is installed and the Vesta renewal job is present. No Docker container is added. The exact unpacked-extension Origin `chrome-extension://jnhhekmehnkcciglenfdeacocibbocbe` is configured; the service was restarted and the allowed public CORS preflight was verified. One pilot conversation is enrolled, online and idle, with remote tasks and final-answer export enabled; no prompt has been sent.
+Deployment status (2026-11-27): **backend running** on the existing Debian 10 VPS as an enabled `chatgpt-session-dispatcher.service`, bound only to `127.0.0.1:8766`. The public HTTPS origin is `https://csd.guddom.com`; its Let's Encrypt certificate is installed and the Vesta renewal job is present. No Docker container is added. The exact unpacked-extension Origin `chrome-extension://jnhhekmehnkcciglenfdeacocibbocbe` is configured. Commit `4ebd9c6e4e5d74bdee5916b540dcf96f297ccc04` is deployed; SQLite retry-task migration and integrity check passed. Pre-deploy backups are stored at `/var/backups/csd/dispatcher.sqlite3.20261127T204808Z` and `/var/backups/csd/chatgpt-session-dispatcher.20261127T204808Z`. One pilot conversation is enrolled, with remote tasks and final-answer export enabled. The initial `ОК` task was manually verified completed from the user's screenshot; a later `ОК2` attempt was claimed/submitted but its completion acknowledgment is uncertain and awaits user visual confirmation.
 
 ## Security boundary
 
@@ -41,7 +41,9 @@ The database path is set by systemd to `/var/lib/csd/dispatcher.sqlite3`.
 - The service was restarted after setting `DISPATCHER_EXTENSION_ORIGIN`; `/health` and the loopback listener were verified afterward.
 - A session worker request without its cookie returns 401; HTTP POST enrollment redirects to HTTPS.
 - Nginx configuration test passes; the Let's Encrypt renewal cron job is present. Vesta's ACME polling parser was corrected to read the JSON `status` field independent of field order; the reproducible one-line patch is `vesta-acme-status-parser.patch`, and the original script is backed up as `/usr/local/vesta/bin/v-add-letsencrypt-domain.orig-20261127`.
-- One user-selected pilot session is enrolled and online; remote task delivery and final-answer export are enabled for that session. No task has been submitted yet.
+- One user-selected pilot session is enrolled and online; remote task delivery and final-answer export are enabled. The initial `ОК` prompt was verified completed from the user's screenshot. The subsequent `ОК2` attempt was claimed and acknowledged as submitted, then ended `uncertain`; it was not automatically replayed.
+- Durable retry scheduler verified on the VPS using a separate unregistered test session: attempt 1 expired, attempts 2 and 3 were created after the 30-second delay, and the task plus its last job were canceled after the third expiry. The test session was then revoked.
+- Retry policy: maximum 3 attempts, 30 seconds between attempts, 10-minute total delivery window. Only jobs that expire while still queued are retried. Claimed, submitted, and uncertain jobs are never replayed.
 
 ## Operational checks
 
