@@ -87,6 +87,17 @@ def run(binary, count, parallel):
             seen = set()
             with cf.ThreadPoolExecutor(max_workers=parallel) as control, cf.ThreadPoolExecutor(max_workers=parallel) as waiting:
                 sessions = list(control.map(enroll, range(count)))
+                registered = set()
+                cursor = ''
+                while True:
+                    page = request('GET', '/v1/sessions?limit=100&after=' + cursor, admin)
+                    for row in page['sessions']:
+                        assert row['id'] not in registered
+                        registered.add(row['id'])
+                    cursor = page.get('next_after')
+                    if cursor is None:
+                        break
+                assert registered == {session[1] for session in sessions}
                 for offset in range(0, count, parallel):
                     batch = list(control.map(heartbeat, sessions[offset:offset + parallel]))
                     futures = [waiting.submit(wait, item) for item in batch]

@@ -6,7 +6,7 @@ use sqlx::{
 };
 use std::{path::Path, time::{Duration, SystemTime, UNIX_EPOCH}};
 use subtle::ConstantTimeEq;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::{Arc, Mutex, Weak}};
 use tokio::{sync::{watch, Semaphore}, time::Instant};
 use uuid::Uuid;
 
@@ -44,7 +44,7 @@ fn validate(value: &str, max: usize, field: &'static str) -> Result<()> {
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
-    changes: watch::Sender<u64>,
+    changes: Arc<Mutex<HashMap<String, Weak<watch::Sender<u64>>>>>,
     waiters: Arc<Semaphore>,
 }
 
@@ -60,6 +60,11 @@ pub struct SessionView {
     pub id: String, pub chat_id: String, pub alias: String, pub export_allowed: bool,
     pub enabled: bool, pub epoch: i64, pub lease_until: i64, pub seen: i64,
     pub status: String, pub online: bool,
+}
+#[derive(Debug, Serialize)]
+pub struct SessionPage {
+    pub sessions: Vec<SessionView>,
+    pub next_after: Option<String>,
 }
 impl Session {
     fn view(self, time: i64) -> SessionView {
@@ -103,12 +108,28 @@ impl Store {
         // A single connection serializes this small personal service's transactions.
         let pool = SqlitePoolOptions::new().max_connections(1).connect_with(options).await?;
         sqlx::raw_sql(include_str!("../schema.sql")).execute(&pool).await?;
-        let (changes, _) = watch::channel(0);
-        Ok(Self { pool, changes, waiters: Arc::new(Semaphore::new(MAX_WAITERS)) })
+        Ok(Self { pool, changes: Arc::new(Mutex::new(HashMap::new())), waiters: Arc::new(Semaphore::new(MAX_WAITERS)) })
     }
-    fn notify_change(&self) {
-        // Coalesce updates; observers always recheck the durable queue.
-        self.changes.send_modify(|revision| *revision = revision.wrapping_add(1));
+    fn session_signal(&self, id: &str) -> Arc<watch::Sender<u64>> {
+        let mut signals = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+        // Weak entries do not keep abandoned waiters alive.
+        signals.retain(|_, signal| signal.strong_count() > 0);
+        if let Some(signal) = signals.get(id).and_then(Weak::upgrade) {
+            return signal;
+        }
+        let (sender, _) = watch::channel(0);
+        let signal = Arc::new(sender);
+        signals.insert(id.to_owned(), Arc::downgrade(&signal));
+        signal
+    }
+    fn notify_change(&self, id: &str) {
+        let signal = {
+            let signals = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+            signals.get(id).and_then(Weak::upgrade)
+        };
+        if let Some(signal) = signal {
+            signal.send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
     }
     // A restarted process cannot attest to delivery in the previous process.
     // Revoke every old lease; keep queued jobs and block ambiguous in-flight jobs.
@@ -162,9 +183,20 @@ impl Store {
         Ok(Enrollment { session, credential })
     }
     pub async fn list(&self, time: i64) -> Result<Vec<SessionView>> {
-        let rows: Vec<Session> = sqlx::query_as("SELECT * FROM sessions ORDER BY seen DESC,id LIMIT 200")
-            .fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|s| s.view(time)).collect())
+        Ok(self.list_page("", 200, time).await?.sessions)
+    }
+    pub async fn list_page(&self, after: &str, limit: u32, time: i64) -> Result<SessionPage> {
+        if limit == 0 || limit > 200 || after.len() > 128 {
+            return Err(Error::Invalid("pagination"));
+        }
+        // Stable identifier ordering is unaffected by changing heartbeats.
+        let mut rows: Vec<Session> = sqlx::query_as("SELECT * FROM sessions WHERE id>? ORDER BY id LIMIT ?")
+            .bind(after).bind(i64::from(limit)+1).fetch_all(&self.pool).await?;
+        let next_after = if rows.len() > limit as usize {
+            rows.pop();
+            rows.last().map(|row| row.id.clone())
+        } else { None };
+        Ok(SessionPage { sessions: rows.into_iter().map(|s| s.view(time)).collect(), next_after })
     }
     pub async fn revoke(&self, id: &str, time: i64) -> Result<()> {
         let mut tx = self.pool.begin().await?;
@@ -176,7 +208,7 @@ impl Store {
         sqlx::query("UPDATE jobs SET state='canceled',updated=? WHERE session_id=? AND state='queued'")
             .bind(time).bind(id).execute(&mut *tx).await?;
         tx.commit().await?;
-        self.notify_change();
+        self.notify_change(id);
         Ok(())
     }
     pub async fn heartbeat(&self, client: &Client, credential: &str, status: &str, time: i64) -> Result<SessionView> {
@@ -197,7 +229,7 @@ impl Store {
             .bind(&client.session_id).execute(&mut *tx).await?;
         let view = Self::session(&mut tx, &client.session_id).await?.view(time);
         tx.commit().await?;
-        if row.status != status || row.epoch != epoch { self.notify_change(); }
+        if row.status != status || row.epoch != epoch { self.notify_change(&client.session_id); }
         Ok(view)
     }
     pub async fn enqueue(&self, id: &str, session_id: &str, prompt: &str, ttl: i64, time: i64) -> Result<Job> {
@@ -220,7 +252,7 @@ impl Store {
             .execute(&mut *tx).await?;
         let job = Self::job_tx(&mut tx, id).await?;
         tx.commit().await?;
-        self.notify_change();
+        self.notify_change(session_id);
         Ok(job)
     }
     async fn job_tx(tx: &mut Transaction<'_, Sqlite>, id: &str) -> Result<Job> {
@@ -280,7 +312,7 @@ impl Store {
             .bind(&job.session_id).execute(&mut *tx).await?;
         let job = Self::job_tx(&mut tx, id).await?;
         tx.commit().await?;
-        self.notify_change();
+        self.notify_change(&job.session_id);
         Ok(job)
     }
     pub async fn review(&self, id: &str) -> Result<Option<Review>> {
@@ -308,10 +340,11 @@ impl Store {
     }
     pub async fn claim_wait(&self, client: &Client, credential: &str, wait_ms: u64) -> Result<Option<Job>> {
         if wait_ms > MAX_WAIT_MS { return Err(Error::Invalid("wait_ms")); }
-        // Subscribe BEFORE checking the queue, avoiding lost notifications.
-        let mut changes = self.changes.subscribe();
         let _permit = self.waiters.clone().try_acquire_owned()
             .map_err(|_| Error::Conflict("too many waiters"))?;
+        // Subscribe BEFORE checking the queue, avoiding lost notifications.
+        let signal = self.session_signal(&client.session_id);
+        let mut changes = signal.subscribe();
         let deadline = Instant::now() + Duration::from_millis(wait_ms);
         loop {
             // The transaction is committed by claim before awaiting any event.
@@ -350,7 +383,7 @@ impl Store {
             .bind(target).bind(result).bind(time).bind(id).execute(&mut *tx).await?;
         let job = Self::job_tx(&mut tx, id).await?;
         tx.commit().await?;
-        self.notify_change();
+        self.notify_change(&client.session_id);
         Ok(job)
     }
 }
@@ -448,6 +481,36 @@ mod tests {
         };
         let (job, ()) = tokio::join!(s.claim_wait(&c,&e.credential,1000),idle);
         assert_eq!(job.unwrap().unwrap().id,"r1");
+    }
+    #[tokio::test]
+    async fn notifications_are_targeted_and_abandoned_signals_do_not_accumulate() {
+        let (s,_,c) = fixture(false).await;
+        let a = s.session_signal(&c.session_id);
+        let b = s.session_signal("other");
+        let a_rx = a.subscribe();
+        let b_rx = b.subscribe();
+        s.enqueue("r1",&c.session_id,"test",600,101).await.unwrap();
+        assert!(a_rx.has_changed().unwrap());
+        assert!(!b_rx.has_changed().unwrap());
+        drop(b_rx);
+        drop(b);
+        let _next = s.session_signal("next");
+        assert!(!s.changes.lock().unwrap().contains_key("other"));
+    }
+    #[tokio::test]
+    async fn registry_cursor_is_stable_and_complete() {
+        let (s,e,c) = fixture(false).await;
+        s.enroll("chat2","test2",false,100).await.unwrap();
+        s.enroll("chat3","test3",false,100).await.unwrap();
+        let first = s.list_page("",1,100).await.unwrap();
+        let cursor = first.next_after.unwrap();
+        assert_eq!(first.sessions[0].id,cursor);
+        s.heartbeat(&c,&e.credential,"busy",101).await.unwrap();
+        let second = s.list_page(&cursor,2,101).await.unwrap();
+        assert_eq!(second.sessions.len(),2);
+        assert!(second.sessions.iter().all(|row| row.id.as_str() > cursor.as_str()));
+        assert!(second.next_after.is_none());
+        assert!(s.list_page("",0,101).await.is_err());
     }
     #[tokio::test]
     async fn operator_review_requires_expired_lease_and_never_requeues() {

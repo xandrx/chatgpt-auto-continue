@@ -1,5 +1,5 @@
 use axum::{
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     extract::Request,
@@ -84,9 +84,16 @@ async fn enroll(State(app): State<App>, headers: HeaderMap, Json(req): Json<Enro
     let enrolled = app.store.enroll(&req.chat_id, &req.alias, req.export_allowed, now()).await?;
     Ok(Json(json!(enrolled)))
 }
-async fn list(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionQuery {
+    #[serde(default)]
+    after: String,
+    limit: Option<u32>,
+}
+async fn list(State(app): State<App>, headers: HeaderMap, Query(query): Query<SessionQuery>) -> ApiResult<Json<Value>> {
     operator(&app, &headers)?;
-    Ok(Json(json!({"sessions":app.store.list(now()).await?})))
+    Ok(Json(json!(app.store.list_page(&query.after, query.limit.unwrap_or(200), now()).await?)))
 }
 async fn revoke(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     operator(&app, &headers)?;
