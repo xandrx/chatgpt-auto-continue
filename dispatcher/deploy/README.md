@@ -1,6 +1,6 @@
 # VPS deployment — Rust Session Dispatcher
 
-Target: dedicated `csd` systemd service on the existing Debian 10 VPS, bound to loopback `127.0.0.1:8766`. The public HTTPS origin is `https://csd.guddom.com`. No Docker container is added.
+Deployment status (2026-11-27): **backend running** on the existing Debian 10 VPS as an enabled `chatgpt-session-dispatcher.service`, bound only to `127.0.0.1:8766`. The public HTTPS origin is `https://csd.guddom.com`; its Let's Encrypt certificate is installed and the Vesta renewal job is present. No Docker container is added. Browser enrollment is intentionally still closed until the exact unpacked-extension Origin is configured.
 
 ## Security boundary
 
@@ -15,7 +15,8 @@ Target: dedicated `csd` systemd service on the existing Debian 10 VPS, bound to 
 ## Files
 
 - `chatgpt-session-dispatcher.service` — systemd unit.
-- `csd.guddom.com.nginx.conf` — location include for the dedicated Vesta-managed subdomain.
+- `csd.guddom.com.nginx.conf` — location include for the dedicated Vesta-managed subdomain; only client enrollment and session worker routes are proxied.
+- `csd.guddom.com.php-fpm-pool.conf` — minimal Vesta compatibility pool for the generated vhost template; ondemand, one worker maximum, loopback only. No PHP application is deployed.
 - Static Linux binary is built by CI for `x86_64-unknown-linux-musl`; this avoids dependence on the VPS's old glibc 2.28.
 
 ## Runtime environment
@@ -29,6 +30,17 @@ Optional, each distinct and 32–512 bytes:
 - `DISPATCHER_EXTENSION_ORIGIN=chrome-extension://<32-character-extension-id>` (set after extension installation)
 
 The database path is set by systemd to `/var/lib/csd/dispatcher.sqlite3`.
+
+## Verified on 2026-11-27
+
+- Local `/health` returns `{"ok":true,"protocol":1,"version":"0.1.0"}`.
+- systemd service is active and enabled; listener is exactly `127.0.0.1:8766`.
+- `/etc/csd/dispatcher.env` is `root:csd` mode `0640`; SQLite is `csd:csd` mode `0600`.
+- Public `/`, `/health`, `/mcp`, `/v1/jobs`, `/v1/sessions`, and session revoke paths return 404.
+- Public enrollment without a configured extension Origin returns 401; CORS preflight for an unconfigured Origin returns 403.
+- A session worker request without its cookie returns 401; HTTP POST enrollment redirects to HTTPS.
+- Nginx configuration test passes; the Let's Encrypt renewal cron job is present.
+- No ChatGPT session has been enrolled and remote task delivery has not been enabled.
 
 ## Operational checks
 
