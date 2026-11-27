@@ -7,10 +7,13 @@ function isExtensionPage(sender) {
     typeof sender.url === 'string' &&
     sender.url.startsWith('chrome-extension://' + chrome.runtime.id + '/');
 }
-function isChatPage(sender) {
-  return sender.id === chrome.runtime.id &&
-    typeof sender.url === 'string' &&
-    sender.url.startsWith('https://chatgpt.com/');
+function isChatPage(sender, chatId) {
+  if (sender.id !== chrome.runtime.id || typeof sender.url !== 'string' ||
+      typeof chatId !== 'string') return false;
+  let url;
+  try { url = new URL(sender.url); } catch (_) { return false; }
+  const segments = url.pathname.split('/');
+  return url.origin === 'https://chatgpt.com' && segments[1] === 'c' && segments[2] === chatId;
 }
 function validChatId(value) {
   return typeof value === 'string' && /^[a-zA-Z0-9_-]{8,256}$/.test(value);
@@ -41,7 +44,11 @@ async function apiRequest(path, method, body, timeoutMs = 12000) {
     });
     let data = null;
     try { data = await response.json(); } catch (_) {}
-    if (!response.ok) throw new Error(data?.error || ('HTTP ' + response.status));
+    if (!response.ok) {
+      const error = new Error(data?.error || ('HTTP ' + response.status));
+      error.status = response.status;
+      throw error;
+    }
     return data;
   } finally {
     clearTimeout(timer);
@@ -73,7 +80,7 @@ async function registerChat(message) {
   const sessions = await getSessions();
   if (sessions[message.chatId]) {
     const existing = sessions[message.chatId];
-    return { registered: true, alreadyRegistered: true, alias: existing.alias || '' };
+    return { registered: true, alreadyRegistered: true, revoked: existing.revoked === true, alias: existing.alias || '' };
   }
   const alias = String(message.alias || 'ChatGPT tab').trim().slice(0, 128) || 'ChatGPT tab';
   const enrolled = await apiRequest('/v1/client/enroll', 'POST', {
@@ -92,7 +99,7 @@ async function registerChat(message) {
   await writeStore(SESSIONS_KEY, sessions);
   return { registered: true, alreadyRegistered: false, alias };
 }
-async function handleMessage(message, sender) {
+async function handleMessageUnsafe(message, sender) {
   if (!message || typeof message.type !== 'string') throw new Error('invalid message');
   if (message.type.startsWith('popup.')) {
     if (!isExtensionPage(sender)) throw new Error('not authorized');
@@ -105,6 +112,7 @@ async function handleMessage(message, sender) {
         registered: Boolean(session),
         remoteEnabled: await getRemoteEnabled(message.chatId),
         exportAllowed: session?.exportAllowed === true,
+        revoked: session?.revoked === true,
         alias: session?.alias || ''
       };
     }
@@ -117,7 +125,7 @@ async function handleMessage(message, sender) {
     throw new Error('unknown popup action');
   }
 
-  if (!isChatPage(sender)) throw new Error('not authorized');
+  if (!isChatPage(sender, message.chatId)) throw new Error('not authorized');
   if (!validChatId(message.chatId)) throw new Error('invalid chat id');
   const { sessions, session } = await getSession(message.chatId);
   const worker = message.worker;
@@ -176,6 +184,26 @@ async function handleMessage(message, sender) {
     );
   }
   throw new Error('unknown content action');
+}
+
+async function handleMessage(message, sender) {
+  try {
+    return await handleMessageUnsafe(message, sender);
+  } catch (error) {
+    const sessionRejected = error?.status === 401 ||
+      (error?.status === 404 && ['content.heartbeat', 'content.wait'].includes(message?.type));
+    if (validChatId(message?.chatId) && isChatPage(sender, message.chatId) && sessionRejected) {
+      // A revoked/missing server session must fail closed locally as well.
+      await setRemoteEnabled(message.chatId, false);
+      const sessions = await getSessions();
+      if (sessions[message.chatId]) {
+        sessions[message.chatId].revoked = true;
+        await writeStore(SESSIONS_KEY, sessions);
+      }
+      throw new Error('server session revoked or missing; remote tasks disabled — administrator action required');
+    }
+    throw error;
+  }
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

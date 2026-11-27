@@ -34,4 +34,5 @@ jobs:
           node --check dispatcher/extension/background.js
           node --check dispatcher/extension/content.js
           node --check dispatcher/extension/popup.js
+          node dispatcher/extension/tests/background.test.js
           python3 -c "import json,pathlib; json.loads(pathlib.Path('dispatcher/extension/manifest.json').read_text())"

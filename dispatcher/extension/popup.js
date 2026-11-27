@@ -1,7 +1,7 @@
 const $ = id => document.getElementById(id);
 let activeTab = null;
 let activeChat = null;
-let currentState = { registered: false, remoteEnabled: false, exportAllowed: false };
+let currentState = { registered: false, remoteEnabled: false, exportAllowed: false, revoked: false };
 
 async function background(message) {
   const response = await chrome.runtime.sendMessage(message);
@@ -50,15 +50,15 @@ async function refreshState() {
     ? currentState.exportAllowed === true : $('exportAllowed').checked;
   $('exportAllowed').disabled = Boolean(currentState.registered);
   $('remoteEnabled').checked = currentState.remoteEnabled === true;
-  $('remoteEnabled').disabled = !currentState.registered;
-  $('registrationState').textContent = currentState.registered ? 'Registered' : 'Not registered';
+  $('remoteEnabled').disabled = !currentState.registered || currentState.revoked;
+  $('registrationState').textContent = currentState.revoked ? 'Revoked' : (currentState.registered ? 'Registered' : 'Not registered');
 }
 async function refresh() {
   try {
     $('status').textContent = 'Checking…';
     await loadActiveChat();
     $('status').textContent = currentState.registered
-      ? (currentState.remoteEnabled ? 'Remote tasks enabled' : 'Chat registered; remote tasks off')
+      ? (currentState.revoked ? 'Session revoked — administrator action required' : (currentState.remoteEnabled ? 'Remote tasks enabled' : 'Chat registered; remote tasks off'))
       : 'Not connected';
   } catch (error) {
     $('status').textContent = String(error?.message || 'Connection failed');
@@ -111,7 +111,7 @@ $('remoteEnabled').addEventListener('change', async () => {
   } catch (error) {
     $('status').textContent = String(error?.message || 'Could not update remote setting');
     $('remoteEnabled').checked = currentState.remoteEnabled === true;
-    $('remoteEnabled').disabled = !currentState.registered;
+    $('remoteEnabled').disabled = !currentState.registered || currentState.revoked;
   }
 });
 $('refresh').addEventListener('click', refresh);
