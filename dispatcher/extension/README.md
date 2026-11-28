@@ -23,9 +23,10 @@ The optional `DISPATCHER_ENROLL_TOKEN` remains available for non-extension clien
 - The cookie path is limited to that session's `/v1/sessions/<id>` endpoints. It cannot list sessions, enqueue jobs, revoke sessions or call the operator API.
 - The server accepts extension requests only from the exact configured `DISPATCHER_EXTENSION_ORIGIN`. CORS preflight is restricted to that origin.
 - Remote work is off by default and is enabled separately per conversation. A non-empty composer, active generation, unanswered user turn or visible error prevents a new claim.
+- Worker identity is derived in the background service worker from Chrome's `sender.tab.id`, not from content-script data or cloned `sessionStorage`. Duplicate tabs therefore receive different worker IDs; the server lease permits only one owner. Subframes are rejected.
 - A claimed task is sent once. If submission or completion cannot be confirmed, the client reports `uncertain`; it never retries the prompt automatically.
 - Answer export is off by default and can only be selected during registration. When disabled, the background service worker sends an empty result.
 
 ## Current limitations
 
-This is an initial development client. Real Chromium/Edge end-to-end testing is still required for private-network permission prompts, cookie acceptance on loopback, ChatGPT DOM selector changes, background-tab throttling, reload/navigation recovery and long-running responses. Keep it on harmless test prompts until those tests pass. No VPS deployment is configured.
+The Rust backend is deployed on the VPS and one real ChatGPT conversation has passed a narrow harmless-prompt pilot. The synthetic Node VM tests now cover tab-scoped worker identity and duplicate-tab lease rejection, but they do not emulate Chromium cookie policy, extension Origin, background scheduling or ChatGPT's live DOM. Real Chromium/Edge end-to-end testing is still required for private-network permission prompts, cookie acceptance on loopback, ChatGPT DOM selector changes, background-tab throttling, reload/navigation recovery and long-running responses. Keep multi-chat operation and unattended dispatch disabled until those tests pass.

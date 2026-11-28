@@ -1,6 +1,6 @@
 # MV3 browser end-to-end acceptance
 
-Status: **not yet run**. CI's Node VM test validates the extension background message boundary; it does not emulate Chromium cookie policy, extension Origin, tabs, background scheduling or ChatGPT's live DOM.
+Status: **live browser matrix not yet run**. The Node VM test now verifies tab-derived worker identity, duplicate-tab lease rejection, sender isolation and gated export. It still does not emulate Chromium cookie policy, extension Origin, real tab scheduling or ChatGPT's live DOM.
 
 ## Test environment
 - Dedicated Windows workstation, current Chrome or Edge, Rust release binary on the same machine.
@@ -25,4 +25,4 @@ Status: **not yet run**. CI's Node VM test validates the extension background me
 12. **Revocation** — revoke the session server-side while the tab is enabled. The first rejected heartbeat/wait must disable remote polling locally, persist a revoked marker, and show an actionable popup state. The unique chat binding cannot silently re-enroll or rebind; administrator recovery is required.
 
 ## Live pilot and release gate
-A narrowly scoped live pilot is authorized for one user-selected real conversation and one explicitly approved harmless prompt. Register only that conversation; keep `Accept remote tasks` off until ready; enable `Export final answers` only if the user wants to verify response return. Confirm the result, disable remote tasks again, and record browser version, extension version, OS and observed states. Do not enroll or enable all real conversations. Do not broaden the pilot to multiple chats or unattended dispatch until the remaining applicable matrix passes on Chrome and Edge. A successful CI run is not a substitute for this matrix.
+A narrowly scoped pilot has been completed in one user-selected real conversation; the user confirmed that harmless prompts `ОК` and `ОК2` appeared and received answers. For any additional live prompt, obtain approval for the exact text before queueing it. Keep every other conversation unregistered or remote-disabled. Do not broaden the pilot to multiple chats or unattended dispatch until the remaining applicable matrix passes on Chrome and Edge. A successful CI run is not a substitute for this matrix.

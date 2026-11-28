@@ -18,8 +18,12 @@ function isChatPage(sender, chatId) {
 function validChatId(value) {
   return typeof value === 'string' && /^[a-zA-Z0-9_-]{8,256}$/.test(value);
 }
-function validWorker(value) {
-  return typeof value === 'string' && value.length > 0 && value.length <= 128;
+function workerForTab(sender) {
+  const tabId = sender?.tab?.id;
+  if (!Number.isSafeInteger(tabId) || tabId < 0 || sender.frameId !== 0) {
+    throw new Error('a top-level browser tab is required');
+  }
+  return 'tab-' + tabId;
 }
 async function readStore(key, fallback) {
   const data = await chrome.storage.local.get(key);
@@ -128,8 +132,9 @@ async function handleMessageUnsafe(message, sender) {
   if (!isChatPage(sender, message.chatId)) throw new Error('not authorized');
   if (!validChatId(message.chatId)) throw new Error('invalid chat id');
   const { sessions, session } = await getSession(message.chatId);
-  const worker = message.worker;
-  if (!validWorker(worker)) throw new Error('invalid worker id');
+  // sessionStorage can be cloned when a tab is duplicated. Derive the worker
+  // identity from Chrome's sender metadata so two tabs never share a lease.
+  const worker = workerForTab(sender);
 
   if (message.type === 'content.state') {
     return {

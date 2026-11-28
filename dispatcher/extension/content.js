@@ -9,10 +9,8 @@
   const RESPONSE_TIMEOUT_MS = 10 * 60 * 1000;
   const QUIET_MS = 5000;
   const ACTIVITY_MS = 2500;
-  const WORKER_KEY = 'csd_extension_worker_v1';
 
   let chatId = getChatId();
-  let worker = getWorkerId();
   let registered = false;
   let remoteEnabled = false;
   let exportAllowed = false;
@@ -32,19 +30,6 @@
   function getChatId() {
     const match = (location.pathname || '').match(/\/c\/([a-zA-Z0-9_-]+)(?:\/|$)/);
     return match?.[1] || null;
-  }
-  function getWorkerId() {
-    try {
-      let id = sessionStorage.getItem(WORKER_KEY);
-      if (!id) {
-        id = typeof crypto?.randomUUID === 'function'
-          ? crypto.randomUUID() : Date.now() + '_' + Math.random().toString(36).slice(2);
-        sessionStorage.setItem(WORKER_KEY, id);
-      }
-      return id.slice(0, 128);
-    } catch (_) {
-      return Date.now() + '_' + Math.random().toString(36).slice(2);
-    }
   }
   function aliasFromTitle() {
     return String(document.title || 'ChatGPT tab')
@@ -361,7 +346,6 @@
       await sendBackground({
         type: 'content.ack',
         chatId: job.chatId,
-        worker: job.worker,
         requestId: job.id,
         state,
         result
@@ -376,7 +360,6 @@
     const active = {
       id: job.id,
       chatId: targetChatId,
-      worker,
       prompt: job.prompt
     };
     activeJob = active;
@@ -408,7 +391,7 @@
       remoteEnabled = false;
       return;
     }
-    const state = await sendBackground({ type: 'content.state', chatId: current, worker });
+    const state = await sendBackground({ type: 'content.state', chatId: current });
     registered = state.registered === true;
     remoteEnabled = state.remoteEnabled === true;
     exportAllowed = state.exportAllowed === true;
@@ -421,7 +404,7 @@
       const status = activeJob ? 'busy' : (remoteEnabled && safe ? 'idle' : 'blocked');
       if (Date.now() - lastHeartbeat < HEARTBEAT_MS && status === lastHeartbeatStatus) return;
       const result = await sendBackground({
-        type: 'content.heartbeat', chatId, worker, status
+        type: 'content.heartbeat', chatId, status
       });
       lastHeartbeat = Date.now();
       lastHeartbeatStatus = status;
@@ -440,14 +423,14 @@
     const targetChatId = chatId;
     try {
       const response = await sendBackground({
-        type: 'content.wait', chatId: targetChatId, worker, waitMs: POLL_WAIT_MS
+        type: 'content.wait', chatId: targetChatId, waitMs: POLL_WAIT_MS
       });
       pollBackoffMs = 2000;
       nextPollAt = Date.now();
       if (response?.job && getChatId() === targetChatId) {
         await processJob(response.job, targetChatId);
       } else if (response?.job) {
-        await acknowledge({ id: response.job.id, chatId: targetChatId, worker }, 'failed');
+        await acknowledge({ id: response.job.id, chatId: targetChatId }, 'failed');
       }
     } catch (error) {
       lastError = String(error?.message || 'poll failed');
